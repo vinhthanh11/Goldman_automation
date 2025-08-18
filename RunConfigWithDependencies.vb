@@ -376,18 +376,23 @@ End Sub
 Sub ApplyOptions(ws As Worksheet, options As String)
     Dim optArr() As String, kv() As String, i As Long
     Dim opt As Object: Set opt = CreateObject("Scripting.Dictionary")
-    If options = "" Then Exit Sub
+    If Trim$(options) = "" Then Exit Sub
 
+    ' Parse: "Key=Value;Flag;Key2=Value2"
     optArr = Split(options, ";")
     For i = LBound(optArr) To UBound(optArr)
-        If InStr(optArr(i), "=") > 0 Then
-            kv = Split(optArr(i), "=")
-            opt(LCase(Trim(kv(0)))) = Trim(kv(1))
-        ElseIf Len(Trim(optArr(i)))) > 0 Then
-            opt(LCase(Trim(optArr(i)))) = True
+        optArr(i) = Trim$(optArr(i))
+        If optArr(i) <> "" Then
+            If InStr(optArr(i), "=") > 0 Then
+                kv = Split(optArr(i), "=", 2)
+                opt(LCase$(Trim$(kv(0)))) = Trim$(kv(1))
+            Else
+                opt(LCase$(optArr(i))) = True
+            End If
         End If
     Next i
 
+    ' Basic formatting
     If opt.Exists("headersbold") Then
         ws.Rows(1).Font.Bold = True
         ws.Rows(1).Interior.Color = RGB(200, 200, 200)
@@ -399,7 +404,8 @@ Sub ApplyOptions(ws As Worksheet, options As String)
     End If
 
     ' Number formats by header (after renaming)
-    ' Syntax: NumFmt=Amount:#,##0.00|UsdEquivalent:#,##0.00|RWA Exposure:0.00%|PaymentDate:yyyy-mm-dd
+    ' Syntax example:
+    ' NumFmt=Amount:#,##0.00|UsdEquivalent:#,##0.00|RWA Exposure:0.00%|Calculation_PaymentDate:yyyy-mm-dd
     If opt.Exists("numfmt") Then
         Dim pairs() As String, p As Variant, colFmt() As String
         Dim colIdx As Long, lastRow As Long
@@ -408,10 +414,10 @@ Sub ApplyOptions(ws As Worksheet, options As String)
 
         For Each p In pairs
             If InStr(p, ":") > 0 Then
-                colFmt = Split(p, ":")
-                colIdx = FindCol(ws, colFmt(0))
+                colFmt = Split(p, ":", 2)
+                colIdx = FindCol(ws, Trim$(colFmt(0)))
                 If colIdx > 0 Then
-                    ws.Range(ws.Cells(2, colIdx), ws.Cells(Application.Max(2, lastRow), colIdx)).NumberFormat = colFmt(1)
+                    ws.Range(ws.Cells(2, colIdx), ws.Cells(Application.Max(2, lastRow), colIdx)).NumberFormat = Trim$(colFmt(1))
                 End If
             End If
         Next p
