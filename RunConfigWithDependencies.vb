@@ -1,5 +1,16 @@
 Option Explicit
 
+' =========================
+' CONFIG SHEET COLUMNS
+' A: SheetName
+' B: Source          (raw sheet name, or blank if dependent)
+' C: ParentReport    (upstream sheet name, or blank if base)
+' D: FilterRules     (see operator guide below)
+' E: KeepColumns     (CSV of headers to copy, in order)
+' F: RenameMap       (CSV of "Original:New" pairs)
+' G: Options         (e.g. "HeadersBold=True;AutoFit=True;NumFmt=Amount:#,##0.00|RWA Exposure:0.00%")
+' =========================
+
 ' ========= MAIN (runs everything per Config) =========
 Sub RunConfigWithDependencies()
     Dim wsConfig As Worksheet, order As Collection
@@ -7,10 +18,15 @@ Sub RunConfigWithDependencies()
     Dim sheetName As String, sourceName As String, parentName As String
     Dim filterRules As String, keepCols As String, renameMap As String, options As String
     Dim wsInput As Worksheet, wsTarget As Worksheet
+    Dim scrn As Boolean, calc As XlCalculation
+
+    ' optional speed-ups
+    scrn = Application.ScreenUpdating: Application.ScreenUpdating = False
+    calc = Application.Calculation:    Application.Calculation = xlCalculationManual
 
     Set wsConfig = ThisWorkbook.Sheets("Config")
     Set order = GetExecutionOrder(wsConfig)
-    If order Is Nothing Then Exit Sub
+    If order Is Nothing Then GoTo Cleanup
 
     For i = 1 To order.Count
         sheetName = CStr(order(i))
@@ -20,9 +36,9 @@ Sub RunConfigWithDependencies()
         sourceName = Trim(CStr(wsConfig.Cells(cfgRow, 2).Value))   ' Source
         parentName = Trim(CStr(wsConfig.Cells(cfgRow, 3).Value))   ' ParentReport
         filterRules = CStr(wsConfig.Cells(cfgRow, 4).Value)
-        keepCols = CStr(wsConfig.Cells(cfgRow, 5).Value)
-        renameMap = CStr(wsConfig.Cells(cfgRow, 6).Value)
-        options   = CStr(wsConfig.Cells(cfgRow, 7).Value)
+        keepCols    = CStr(wsConfig.Cells(cfgRow, 5).Value)
+        renameMap   = CStr(wsConfig.Cells(cfgRow, 6).Value)
+        options     = CStr(wsConfig.Cells(cfgRow, 7).Value)
 
         ' Decide input sheet
         Set wsInput = Nothing
@@ -38,10 +54,14 @@ Sub RunConfigWithDependencies()
 
         ' Process
         FilterAndCopy_Flex wsInput, wsTarget, filterRules, keepCols
-        ApplyRenameMap wsTarget, renameMap
-        ApplyOptions   wsTarget, options
+        ApplyRenameMap     wsTarget, renameMap
+        ApplyOptions       wsTarget, options
 NextItem:
     Next i
+
+Cleanup:
+    Application.ScreenUpdating = scrn
+    Application.Calculation = calc
 End Sub
 
 ' ========= DEPENDENCY RESOLVER (topological sort) =========
@@ -97,6 +117,17 @@ Function GetExecutionOrder(wsConfig As Worksheet) As Collection
     End If
 End Function
 
+' ========= FILTER + COPY (ALL visible rows; supports advanced operators) =========
+' Operators (AND across rules; OR within value via "|"):
+'   =   equals (case-insensitive, OR via "|")
+'   <>  not equal (single value, CI)   |  !=  not equal (multi OR, CI; blank value excludes blanks/spaces)
+'   ~   contains (CI; up to two patterns via "|")
+'   !~  does NOT contain (CI; any number of patterns)
+'   >, <, >=, <= numeric/date comparisons
+'   =^  equals (case-sensitive, OR via "|")
+'   ~^  contains (case-sensitive, any number)
+'   !=^ not equal (case-sensitive, OR via "|"; blank value excludes blanks/spaces)
+'   !~^ does NOT contain (case-sensitive, any number)
 Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
                        filterRules As String, keepCols As String)
 
@@ -114,13 +145,15 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     Dim exEqCI As Object, exContCI As Object      ' (case-insensitive) colIdx -> dict(values/pats)
     Dim exEqCS As Object, exContCS As Object      ' (case-sensitive)   colIdx -> dict(values/pats)
     Dim incEqCS As Object, incContCS As Object    ' (case-sensitive includes) colIdx -> dict(values/pats)
+    Dim dictTmp As Object
+    Dim v As Variant, p As Variant
 
-    Set exBlank  = CreateObject("Scripting.Dictionary")
-    Set exEqCI   = CreateObject("Scripting.Dictionary")
-    Set exContCI = CreateObject("Scripting.Dictionary")
-    Set exEqCS   = CreateObject("Scripting.Dictionary")
-    Set exContCS = CreateObject("Scripting.Dictionary")
-    Set incEqCS  = CreateObject("Scripting.Dictionary")
+    Set exBlank   = CreateObject("Scripting.Dictionary")
+    Set exEqCI    = CreateObject("Scripting.Dictionary")
+    Set exContCI  = CreateObject("Scripting.Dictionary")
+    Set exEqCS    = CreateObject("Scripting.Dictionary")
+    Set exContCS  = CreateObject("Scripting.Dictionary")
+    Set incEqCS   = CreateObject("Scripting.Dictionary")
     Set incContCS = CreateObject("Scripting.Dictionary")
 
     Set colDict = CreateObject("Scripting.Dictionary")
@@ -174,8 +207,6 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
             If Not colDict.Exists(LCase(fieldName)) Then GoTo NextRule
 
             Dim fld As Long: fld = colDict(LCase(fieldName))
-            Dim v As Variant, p As Variant
-            Dim dictTmp As Object
 
             Select Case op
                 ' ---------- CASE-SENSITIVE includes ----------
@@ -262,6 +293,7 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
                     If UBound(critArr) = 0 Then
                         rngData.AutoFilter Field:=fld, Criteria1:="*" & Trim(critArr(0)) & "*"
                     Else
+                        ' supports two contains terms via OR; for >2 terms, switch to ~^
                         rngData.AutoFilter Field:=fld, _
                                           Criteria1:="*" & Trim(critArr(0)) & "*", _
                                           Operator:=xlOr, _
@@ -319,6 +351,27 @@ NextKeep:
     wsSource.AutoFilterMode = False
 End Sub
 
+' ========= RENAME HEADERS =========
+Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
+    Dim pairs() As String, p As Variant, kv() As String
+    Dim lastCol As Long, i As Long
+    If renameMap = "" Then Exit Sub
+
+    pairs = Split(renameMap, ",")
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+
+    For Each p In pairs
+        kv = Split(p, ":")
+        If UBound(kv) = 1 Then
+            For i = 1 To lastCol
+                If LCase(Trim(ws.Cells(1, i).Value)) = LCase(Trim(kv(0))) Then
+                    ws.Cells(1, i).Value = Trim(kv(1))
+                End If
+            Next i
+        End If
+    Next p
+End Sub
+
 ' ========= OPTIONS: headers, autofit, freeze, number formats by header =========
 Sub ApplyOptions(ws As Worksheet, options As String)
     Dim optArr() As String, kv() As String, i As Long
@@ -330,7 +383,7 @@ Sub ApplyOptions(ws As Worksheet, options As String)
         If InStr(optArr(i), "=") > 0 Then
             kv = Split(optArr(i), "=")
             opt(LCase(Trim(kv(0)))) = Trim(kv(1))
-        ElseIf Len(Trim(optArr(i))) > 0 Then
+        ElseIf Len(Trim(optArr(i)))) > 0 Then
             opt(LCase(Trim(optArr(i)))) = True
         End If
     Next i
@@ -393,9 +446,9 @@ Sub RunConfigSubset(startSheet As String)
         sourceName = Trim(CStr(wsConfig.Cells(cfgRow, 2).Value))
         parentName = Trim(CStr(wsConfig.Cells(cfgRow, 3).Value))
         filterRules = CStr(wsConfig.Cells(cfgRow, 4).Value)
-        keepCols   = CStr(wsConfig.Cells(cfgRow, 5).Value)
-        renameMap  = CStr(wsConfig.Cells(cfgRow, 6).Value)
-        options    = CStr(wsConfig.Cells(cfgRow, 7).Value)
+        keepCols    = CStr(wsConfig.Cells(cfgRow, 5).Value)
+        renameMap   = CStr(wsConfig.Cells(cfgRow, 6).Value)
+        options     = CStr(wsConfig.Cells(cfgRow, 7).Value)
 
         Set wsInput = Nothing
         If sourceName <> "" And SheetExists(sourceName) Then
@@ -407,8 +460,8 @@ Sub RunConfigSubset(startSheet As String)
 
         Set wsTarget = GetOrCreateSheet(sheetName)
         FilterAndCopy_Flex wsInput, wsTarget, filterRules, keepCols
-        ApplyRenameMap wsTarget, renameMap
-        ApplyOptions   wsTarget, options
+        ApplyRenameMap     wsTarget, renameMap
+        ApplyOptions       wsTarget, options
 NextItem:
     Next i
 End Sub
@@ -468,7 +521,6 @@ Function FindCol(ws As Worksheet, header As String) As Long
     FindCol = 0
 End Function
 
-                                                                                                                                                                                                                    
 Private Function RowPassesRules(ws As Worksheet, r As Long, _
                                 exBlank As Object, exEqCI As Object, exContCI As Object, _
                                 exEqCS As Object, exContCS As Object, _
@@ -523,7 +575,7 @@ Private Function RowPassesRules(ws As Worksheet, r As Long, _
         Next pat
     Next k
 
-    ' Include equals (case-sensitive) -> must match at least one allowed value per column
+    ' Include equals (case-sensitive): must match at least one allowed value per column
     For Each k In incEqCS.Keys
         v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
         hit = False
@@ -535,7 +587,7 @@ Private Function RowPassesRules(ws As Worksheet, r As Long, _
         If Not hit Then RowPassesRules = False: Exit Function
     Next k
 
-    ' Include contains (case-sensitive) -> must contain at least one pattern per column
+    ' Include contains (case-sensitive): must contain at least one allowed pattern per column
     For Each k In incContCS.Keys
         v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
         hit = False
@@ -551,7 +603,3 @@ Private Function RowPassesRules(ws As Worksheet, r As Long, _
 
     RowPassesRules = True
 End Function
-                                                                                                                                                                           
-                                                                                                                                                                                                                    
-                                                                                                                                                                                                                    
-                                                                                                                                                                                                                    
