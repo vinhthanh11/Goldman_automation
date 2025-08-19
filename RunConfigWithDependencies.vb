@@ -477,56 +477,50 @@ Private Function RowPassesRules(ws As Worksheet, r As Long, _
 End Function
 
 ' ========= RENAME HEADERS (robust; ignores missing/dup targets) =========
-' Normalize header text for matching: trim, collapse spaces, remove NBSP, case-insensitive
 Private Function NormHeader(ByVal s As String) As String
     Dim t As String
     t = CStr(s)
-    t = Replace$(t, Chr$(160), " ")                 ' NBSP -> space
-    t = Application.WorksheetFunction.Trim(t)       ' trims + collapses multiple spaces
+    t = Replace$(t, Chr$(160), " ")                       ' NBSP -> space
+    t = Application.WorksheetFunction.Trim(t)             ' trim + collapse
     NormHeader = LCase$(t)
 End Function
 
 Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
-    Const RENAME_ALL_DUPLICATES As Boolean = False  ' True -> rename all duplicate source headers
+    Const RENAME_ALL_DUPLICATES As Boolean = False
 
     Dim pairs() As String, p As Variant, kv() As String
     Dim src As String, dest As String
     Dim srcN As String, destN As String
     Dim lastCol As Long, i As Long
-    Dim headers As Object          ' norm header -> Collection of column indexes (snapshot)
+    Dim headers As Object, seenDest As Object
     Dim colIdxs As Collection
-    Dim seenDest As Object         ' norm dest already present -> column index (any)
     Dim h As String, hN As String
-    Dim vIdx As Variant            ' <-- Variant for For Each over Collection
+    Dim vIdx As Variant
     Dim sameCol As Boolean
 
     renameMap = Trim$(renameMap)
     If renameMap = "" Then Exit Sub
 
     lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
-
     Set headers = CreateObject("Scripting.Dictionary")
     Set seenDest = CreateObject("Scripting.Dictionary")
 
-    ' ---- snapshot current headers (so renames do NOT cascade) ----
+    ' snapshot headers
     For i = 1 To lastCol
         h = CStr(ws.Cells(1, i).Value)
         hN = NormHeader(h)
         If Not headers.Exists(hN) Then
             Set colIdxs = New Collection
-            Set headers(hN) = colIdxs          ' <-- USE Set here
+            headers(hN) = colIdxs
         End If
         headers(hN).Add i
-
         If Not seenDest.Exists(hN) Then seenDest(hN) = i
     Next i
 
-    ' ---- process "Original:New" pairs safely ----
     pairs = Split(renameMap, ",")
     For Each p In pairs
         If InStr(p, ":") = 0 Then GoTo NextP
         kv = Split(p, ":", 2)
-
         src = Trim$(kv(0))
         dest = Trim$(kv(1))
         If src = "" Or dest = "" Then GoTo NextP
@@ -534,10 +528,8 @@ Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
         srcN = NormHeader(src)
         destN = NormHeader(dest)
 
-        ' source must exist (in snapshot) — otherwise ignore silently
         If Not headers.Exists(srcN) Then GoTo NextP
 
-        ' if the destination header already exists elsewhere, skip (avoid duplicates)
         If seenDest.Exists(destN) Then
             sameCol = False
             For Each vIdx In headers(srcN)
@@ -546,7 +538,6 @@ Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
             If Not sameCol Then GoTo NextP
         End If
 
-        ' perform rename(s)
         If RENAME_ALL_DUPLICATES Then
             For Each vIdx In headers(srcN)
                 ws.Cells(1, CLng(vIdx)).Value = dest
@@ -554,9 +545,55 @@ Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
         Else
             ws.Cells(1, CLng(headers(srcN)(1))).Value = dest
         End If
-
 NextP:
     Next p
+End Sub
+
+' ========= OPTIONS (headers, autofit, freeze, number formats) =========
+Sub ApplyOptions(ws As Worksheet, options As String)
+    Dim optArr() As String, kv() As String, i As Long
+    Dim opt As Object: Set opt = CreateObject("Scripting.Dictionary")
+    If Trim$(options) = "" Then Exit Sub
+
+    optArr = Split(options, ";")
+    For i = LBound(optArr) To UBound(optArr)
+        optArr(i) = Trim$(optArr(i))
+        If optArr(i) <> "" Then
+            If InStr(optArr(i), "=") > 0 Then
+                kv = Split(optArr(i), "=", 2)
+                opt(LCase$(Trim$(kv(0)))) = Trim$(kv(1))
+            Else
+                opt(LCase$(optArr(i))) = True
+            End If
+        End If
+    Next i
+
+    If opt.Exists("headersbold") Then
+        ws.Rows(1).Font.Bold = True
+        ws.Rows(1).Interior.Color = RGB(200, 200, 200)
+    End If
+    If opt.Exists("autofit") Then ws.Cells.EntireColumn.AutoFit
+    If opt.Exists("freezetoprow") Then
+        ws.Activate: ActiveWindow.FreezePanes = False
+        ws.Rows(2).Select: ActiveWindow.FreezePanes = True
+    End If
+
+    If opt.Exists("numfmt") Then
+        Dim pairs() As String, p As Variant, colFmt() As String
+        Dim colIdx As Long, lastRow As Long
+        pairs = Split(opt("numfmt"), "|")
+        lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+
+        For Each p In pairs
+            If InStr(p, ":") > 0 Then
+                colFmt = Split(p, ":", 2)
+                colIdx = FindCol(ws, Trim$(colFmt(0)))
+                If colIdx > 0 Then
+                    ws.Range(ws.Cells(2, colIdx), ws.Cells(Application.Max(2, lastRow), colIdx)).NumberFormat = Trim$(colFmt(1))
+                End If
+            End If
+        Next p
+    End If
 End Sub
 
 ' ========= OPTIONAL: RUN SUBSETS =========
