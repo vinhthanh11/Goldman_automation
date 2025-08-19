@@ -5,9 +5,9 @@ Option Explicit
 ' A: SheetName
 ' B: Source          (raw sheet name, or blank if dependent)
 ' C: ParentReport    (upstream sheet name, or blank if base)
-' D: FilterRules     (see operator guide)
-' E: KeepColumns     (CSV of headers to copy, in order)
-' F: RenameMap       (CSV of "Original:New" pairs)
+' D: FilterRules     (see operator guide below)
+' E: KeepColumns     (CSV of headers to copy, in order; use SOURCE header names)
+' F: RenameMap       (CSV of "Original:New" pairs; missing originals are ignored)
 ' G: Options         (e.g. "HeadersBold=True;AutoFit=True;NumFmt=Amount:#,##0.00|RWA Exposure:0.00%")
 ' =========================
 
@@ -20,6 +20,7 @@ Sub RunConfigWithDependencies()
     Dim wsInput As Worksheet, wsTarget As Worksheet
     Dim scrn As Boolean, calc As XlCalculation
 
+    ' optional speed-ups
     scrn = Application.ScreenUpdating: Application.ScreenUpdating = False
     calc = Application.Calculation:    Application.Calculation = xlCalculationManual
 
@@ -39,6 +40,7 @@ Sub RunConfigWithDependencies()
         renameMap   = CStr(wsConfig.Cells(cfgRow, 6).Value)
         options     = CStr(wsConfig.Cells(cfgRow, 7).Value)
 
+        ' Decide input sheet
         Set wsInput = Nothing
         If sourceName <> "" Then
             If SheetExists(sourceName) Then Set wsInput = ThisWorkbook.Sheets(sourceName)
@@ -47,8 +49,10 @@ Sub RunConfigWithDependencies()
         End If
         If wsInput Is Nothing Then GoTo NextItem
 
+        ' Ensure target exists
         Set wsTarget = GetOrCreateSheet(sheetName)
 
+        ' Process
         FilterAndCopy_Flex wsInput, wsTarget, filterRules, keepCols
         ApplyRenameMap     wsTarget, renameMap
         ApplyOptions       wsTarget, options
@@ -76,8 +80,8 @@ Function GetExecutionOrder(wsConfig As Worksheet) As Collection
     lastRow = wsConfig.Cells(wsConfig.Rows.Count, 1).End(xlUp).Row
 
     For i = 2 To lastRow
-        sName = CStr(wsConfig.Cells(i, 1).Value)
-        pName = CStr(wsConfig.Cells(i, 3).Value)
+        sName = CStr(wsConfig.Cells(i, 1).Value)  ' SheetName
+        pName = CStr(wsConfig.Cells(i, 3).Value)  ' ParentReport
 
         If Not graph.Exists(sName) Then Set graph(sName) = CreateObject("Scripting.Dictionary")
         If Not indegree.Exists(sName) Then indegree(sName) = 0
@@ -113,19 +117,22 @@ Function GetExecutionOrder(wsConfig As Worksheet) As Collection
     End If
 End Function
 
-' ========= FILTER + COPY (ALL visible rows; advanced operators) =========
+' ========= FILTER + COPY (ALL visible rows; supports advanced operators) =========
 ' Operators (AND across rules; OR within value via "|"):
 '   =    equals (CI, OR via "|")
 '   <>   not equal (single value, CI)
-'   !=   not equal (multi OR, CI). Blank value excludes blanks/spaces
-'   ~    contains (CI; up to 2 terms via "|")
+'   !=   not equal (multi OR, CI). `Status!=` excludes blanks/spaces
+'   ~    contains (CI; up to two patterns via "|")
 '   !~   does NOT contain (CI; any # terms)
 '   >, <, >=, <= numeric/date comparisons
 '   =^   equals (case-sensitive, OR via "|")
 '   ~^   contains (case-sensitive, any # terms)
-'   !=^  not equal (case-sensitive, OR). Blank value excludes blanks/spaces
+'   !=^  not equal (case-sensitive, OR). `Status!=^` excludes blanks/spaces
 '   !~^  does NOT contain (case-sensitive, any # terms)
-'   ~?   NEW: contains (CI include, unlimited OR; supports <blank> token)
+'   ~?   contains (case-insensitive include, unlimited OR, supports `<blank>`)  ← NEW
+'
+' Example (include blanks OR “Not sent” OR “SLC” in LatestComment, CI):
+'   Setts_Input Field_LatestComment~?Not sent|SLC|<blank>
 Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
                        filterRules As String, keepCols As String)
 
@@ -136,14 +143,14 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     Dim critArr() As String
     Dim colArr() As String, pasteCol As Long, c As Long
     Dim srcColIdx As Long, colVis As Range, area As Range
-    Dim destRow As Long, cell As Range
+    Dim destRow As Long
 
-    ' collections for row-level checks
-    Dim exBlank As Object                         ' colIdx -> True
-    Dim exEqCI As Object, exContCI As Object      ' CI excludes
-    Dim exEqCS As Object, exContCS As Object      ' CS excludes
-    Dim incEqCS As Object, incContCS As Object    ' CS includes
-    Dim incContCI As Object                       ' CI includes for ~?
+    ' --- collections for row-level checks ---
+    Dim exBlank As Object                         ' colIdx -> True (exclude trimmed blanks)
+    Dim exEqCI As Object, exContCI As Object      ' (case-insensitive) excludes
+    Dim exEqCS As Object, exContCS As Object      ' (case-sensitive)   excludes
+    Dim incEqCS As Object, incContCS As Object    ' (case-sensitive)   includes
+    Dim incContCI As Object                       ' (case-insensitive) includes for ~?
     Dim dictTmp As Object
     Dim v As Variant, p As Variant
 
@@ -154,11 +161,11 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     Set exContCS  = CreateObject("Scripting.Dictionary")
     Set incEqCS   = CreateObject("Scripting.Dictionary")
     Set incContCS = CreateObject("Scripting.Dictionary")
-    Set incContCI = CreateObject("Scripting.Dictionary")
+    Set incContCI = CreateObject("Scripting.Dictionary") ' NEW
 
     Set colDict = CreateObject("Scripting.Dictionary")
 
-    ' Data range
+    ' Detect data range
     lastRow = wsSource.Cells(wsSource.Rows.Count, 1).End(xlUp).Row
     lastCol = wsSource.Cells(1, wsSource.Columns.Count).End(xlToLeft).Column
     If lastRow < 2 Or lastCol < 1 Then Exit Sub
@@ -166,7 +173,7 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     Set rngData = wsSource.Cells(1, 1).Resize(lastRow, lastCol)
     Set body    = rngData.Offset(1).Resize(rngData.Rows.Count - 1)
 
-    ' Headers map
+    ' Header map (case-insensitive lookup)
     For c = 1 To lastCol
         colDict(LCase(Trim(wsSource.Cells(1, c).Value))) = c
     Next c
@@ -176,20 +183,21 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     If wsSource.AutoFilterMode Then wsSource.AutoFilterMode = False
     rngData.AutoFilter
 
-    ' Parse & apply
+    ' Parse & apply rules
     If Len(Trim(filterRules)) > 0 Then
         rules = Split(filterRules, ";")
         For Each rule In rules
             rule = Trim(CStr(rule))
             If Len(rule) = 0 Then GoTo NextRule
 
+            ' detect operator (check longer tokens first)
             op = ""
             Select Case True
                 Case InStr(rule, "!=^") > 0: op = "!=^"
                 Case InStr(rule, "!~^") > 0: op = "!~^"
                 Case InStr(rule, "=^")  > 0: op = "=^"
                 Case InStr(rule, "~^")  > 0: op = "~^"
-                Case InStr(rule, "~?")  > 0: op = "~?"
+                Case InStr(rule, "~?")  > 0: op = "~?"   ' NEW include CI
                 Case InStr(rule, "!=")  > 0: op = "!="
                 Case InStr(rule, "!~")  > 0: op = "!~"
                 Case InStr(rule, "<>")  > 0: op = "<>"
@@ -209,7 +217,7 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
             Dim fld As Long: fld = colDict(LCase(fieldName))
 
             Select Case op
-                ' CS includes
+                ' ---------- CASE-SENSITIVE includes ----------
                 Case "=^"
                     If Not incEqCS.Exists(fld) Then Set incEqCS(fld) = CreateObject("Scripting.Dictionary")
                     Set dictTmp = incEqCS(fld)
@@ -228,7 +236,7 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
                         dictTmp(Trim$(valueExp)) = True
                     End If
 
-                ' CI includes (~?) with <blank>
+                ' ---------- CASE-INSENSITIVE includes (NEW) ----------
                 Case "~?"
                     If Not incContCI.Exists(fld) Then Set incContCI(fld) = CreateObject("Scripting.Dictionary")
                     Set dictTmp = incContCI(fld)
@@ -249,7 +257,7 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
                         End If
                     End If
 
-                ' CS excludes
+                ' ---------- CASE-SENSITIVE excludes ----------
                 Case "!=^"
                     If valueExp = "" Then
                         exBlank(fld) = True
@@ -272,7 +280,7 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
                         dictTmp(Trim$(valueExp)) = True
                     End If
 
-                ' CI excludes
+                ' ---------- CASE-INSENSITIVE excludes ----------
                 Case "!="
                     If valueExp = "" Then
                         exBlank(fld) = True
@@ -297,7 +305,7 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
                         dictTmp(LCase(Trim$(valueExp))) = True
                     End If
 
-                ' Positive CI rules via AutoFilter
+                ' ---------- POSITIVE CI rules (AutoFilter) ----------
                 Case "="
                     If InStr(valueExp, "|") > 0 Then
                         critArr = Split(valueExp, "|")
@@ -314,6 +322,7 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
                     If UBound(critArr) = 0 Then
                         rngData.AutoFilter Field:=fld, Criteria1:="*" & Trim(critArr(0)) & "*"
                     Else
+                        ' supports two contains terms via OR; for >2, prefer ~?
                         rngData.AutoFilter Field:=fld, _
                                           Criteria1:="*" & Trim(critArr(0)) & "*", _
                                           Operator:=xlOr, _
@@ -342,6 +351,9 @@ NextRule:
         srcColIdx = 0
         If colDict.Exists(LCase(Trim(colArr(c)))) Then
             srcColIdx = colDict(LCase(Trim(colArr(c))))
+        Else
+            ' Uncomment for diagnostics:
+            ' Debug.Print "Skip missing keep column in source: [" & Trim(colArr(c)) & "] on sheet " & wsSource.Name
         End If
         If srcColIdx = 0 Then GoTo NextKeep
 
@@ -350,6 +362,7 @@ NextRule:
 
         Set colVis = Application.Intersect(vis, wsSource.Columns(srcColIdx))
         If Not colVis Is Nothing Then
+            Dim cell As Range
             For Each area In colVis.Areas
                 For Each cell In area.Cells
                     If RowPassesRules(wsSource, cell.Row, _
@@ -371,200 +384,57 @@ NextKeep:
     wsSource.AutoFilterMode = False
 End Sub
 
-Private Function RowPassesRules(ws As Worksheet, r As Long, _
-                                exBlank As Object, exEqCI As Object, exContCI As Object, _
-                                exEqCS As Object, exContCS As Object, _
-                                incEqCS As Object, incContCS As Object, _
-                                incContCI As Object) As Boolean
-    Dim k As Variant, v As String, lv As String, pat As Variant
-    Dim hit As Boolean
-
-    ' Exclude blanks/whitespace
-    For Each k In exBlank.Keys
-        v = CStr(ws.Cells(r, CLng(k)).Value)
-        If Trim$(v) = "" Then RowPassesRules = False: Exit Function
-    Next k
-
-    ' Exclude equals (CI)
-    For Each k In exEqCI.Keys
-        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
-        If exEqCI(k).Exists(LCase$(v)) Then RowPassesRules = False: Exit Function
-    Next k
-
-    ' Exclude contains (CI)
-    For Each k In exContCI.Keys
-        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
-        lv = LCase$(v)
-        For Each pat In exContCI(k).Keys
-            If pat <> "" Then
-                If InStr(1, lv, CStr(pat), vbTextCompare) > 0 Then
-                    RowPassesRules = False: Exit Function
-                End If
-            End If
-        Next pat
-    Next k
-
-    ' Exclude equals (CS)
-    For Each k In exEqCS.Keys
-        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
-        For Each pat In exEqCS(k).Keys
-            If StrComp(v, CStr(pat), vbBinaryCompare) = 0 Then
-                RowPassesRules = False: Exit Function
-            End If
-        Next pat
-    Next k
-
-    ' Exclude contains (CS)
-    For Each k In exContCS.Keys
-        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
-        For Each pat In exContCS(k).Keys
-            If pat <> "" Then
-                If InStr(1, v, CStr(pat), vbBinaryCompare) > 0 Then
-                    RowPassesRules = False: Exit Function
-                End If
-            End If
-        Next pat
-    Next k
-
-    ' Include equals (CS): must hit at least one per column
-    For Each k In incEqCS.Keys
-        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
-        hit = False
-        For Each pat In incEqCS(k).Keys
-            If StrComp(v, CStr(pat), vbBinaryCompare) = 0 Then
-                hit = True: Exit For
-            End If
-        Next pat
-        If Not hit Then RowPassesRules = False: Exit Function
-    Next k
-
-    ' Include contains (CS): must hit at least one per column
-    For Each k In incContCS.Keys
-        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
-        hit = False
-        For Each pat In incContCS(k).Keys
-            If pat <> "" Then
-                If InStr(1, v, CStr(pat), vbBinaryCompare) > 0 Then
-                    hit = True: Exit For
-                End If
-            End If
-        Next pat
-        If Not hit Then RowPassesRules = False: Exit Function
-    Next k
-
-    ' Include contains (CI, ~?): must hit at least one per column; supports <blank>
-    For Each k In incContCI.Keys
-        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
-        lv = LCase$(v)
-        hit = False
-
-        If incContCI(k).Exists("__BLANK__") And Trim$(v) = "" Then
-            hit = True
-        Else
-            For Each pat In incContCI(k).Keys
-                If pat <> "__BLANK__" Then
-                    If InStr(1, lv, CStr(pat), vbTextCompare) > 0 Then
-                        hit = True: Exit For
-                    End If
-                End If
-            Next pat
-        End If
-
-        If Not hit Then RowPassesRules = False: Exit Function
-    Next k
-
-    RowPassesRules = True
-End Function
-
-' ========= RENAME HEADERS (robust; ignores missing/dup targets) =========
-' Normalize header text for matching: trim, collapse spaces, remove NBSP, case-insensitive
-Private Function NormHeader(ByVal s As String) As String
-    Dim t As String
-    t = CStr(s)
-    t = Replace$(t, Chr$(160), " ")                 ' NBSP -> space
-    t = Application.WorksheetFunction.Trim(t)       ' trims + collapses multiple spaces
-    NormHeader = LCase$(t)
-End Function
-
+' ========= RENAME HEADERS (safe: ignore missing originals; avoid collisions) =========
 Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
-    Const RENAME_ALL_DUPLICATES As Boolean = False  ' True -> rename all duplicate source headers
-
-    Dim pairs() As String, p As Variant, kv() As String
-    Dim src As String, dest As String
-    Dim srcN As String, destN As String
+    Dim mapArr() As String, pair As Variant
+    Dim orig As String, newName As String
     Dim lastCol As Long, i As Long
-    Dim headers As Object          ' norm header -> Collection of column indexes (snapshot)
-    Dim colIdxs As Collection
-    Dim seenDest As Object         ' norm dest already present -> column index (any)
-    Dim h As String, hN As String
-    Dim vIdx As Variant            ' <-- Variant for For Each over Collection
-    Dim sameCol As Boolean
+    Dim hdrDict As Object, colIdx As Variant
 
-    renameMap = Trim$(renameMap)
-    If renameMap = "" Then Exit Sub
+    If Trim$(renameMap) = "" Then Exit Sub
 
+    ' Build a header index (case-insensitive)
+    Set hdrDict = CreateObject("Scripting.Dictionary")
     lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
-
-    Set headers = CreateObject("Scripting.Dictionary")
-    Set seenDest = CreateObject("Scripting.Dictionary")
-
-    ' ---- snapshot current headers (so renames do NOT cascade) ----
     For i = 1 To lastCol
-        h = CStr(ws.Cells(1, i).Value)
-        hN = NormHeader(h)
-        If Not headers.Exists(hN) Then
-            Set colIdxs = New Collection
-            Set headers(hN) = colIdxs          ' <-- USE Set here
-        End If
-        headers(hN).Add i
-
-        If Not seenDest.Exists(hN) Then seenDest(hN) = i
+        hdrDict(LCase$(Trim$(ws.Cells(1, i).Value))) = i
     Next i
 
-    ' ---- process "Original:New" pairs safely ----
-    pairs = Split(renameMap, ",")
-    For Each p In pairs
-        If InStr(p, ":") = 0 Then GoTo NextP
-        kv = Split(p, ":", 2)
+    mapArr = Split(renameMap, ",")
+    For Each pair In mapArr
+        pair = Trim$(CStr(pair))
+        If pair <> "" And InStr(pair, ":") > 0 Then
+            orig = Trim$(Split(pair, ":", 2)(0))
+            newName = Trim$(Split(pair, ":", 2)(1))
 
-        src = Trim$(kv(0))
-        dest = Trim$(kv(1))
-        If src = "" Or dest = "" Then GoTo NextP
+            If orig <> "" And newName <> "" Then
+                If hdrDict.Exists(LCase$(orig)) Then
+                    colIdx = hdrDict(LCase$(orig))
 
-        srcN = NormHeader(src)
-        destN = NormHeader(dest)
-
-        ' source must exist (in snapshot) — otherwise ignore silently
-        If Not headers.Exists(srcN) Then GoTo NextP
-
-        ' if the destination header already exists elsewhere, skip (avoid duplicates)
-        If seenDest.Exists(destN) Then
-            sameCol = False
-            For Each vIdx In headers(srcN)
-                If seenDest(destN) = CLng(vIdx) Then sameCol = True: Exit For
-            Next vIdx
-            If Not sameCol Then GoTo NextP
+                    ' avoid collision: if new header exists on different col, skip
+                    If hdrDict.Exists(LCase$(newName)) And hdrDict(LCase$(newName)) <> colIdx Then
+                        ' skip silently
+                    Else
+                        ws.Cells(1, CLng(colIdx)).Value = newName
+                        ' update dictionary
+                        hdrDict.Remove LCase$(orig)
+                        hdrDict(LCase$(newName)) = colIdx
+                    End If
+                Else
+                    ' original not present -> ignore mapping
+                End If
+            End If
         End If
-
-        ' perform rename(s)
-        If RENAME_ALL_DUPLICATES Then
-            For Each vIdx In headers(srcN)
-                ws.Cells(1, CLng(vIdx)).Value = dest
-            Next vIdx
-        Else
-            ws.Cells(1, CLng(headers(srcN)(1))).Value = dest
-        End If
-
-NextP:
-    Next p
+    Next pair
 End Sub
 
-' ========= OPTIONS (headers, autofit, freeze, number formats) =========
+' ========= OPTIONS: headers, autofit, freeze, number formats by header =========
 Sub ApplyOptions(ws As Worksheet, options As String)
     Dim optArr() As String, kv() As String, i As Long
     Dim opt As Object: Set opt = CreateObject("Scripting.Dictionary")
     If Trim$(options) = "" Then Exit Sub
 
+    ' Parse: "Key=Value;Flag;Key2=Value2"
     optArr = Split(options, ";")
     For i = LBound(optArr) To UBound(optArr)
         optArr(i) = Trim$(optArr(i))
@@ -588,6 +458,8 @@ Sub ApplyOptions(ws As Worksheet, options As String)
         ws.Rows(2).Select: ActiveWindow.FreezePanes = True
     End If
 
+    ' Number formats by header (after renaming)
+    ' Syntax: NumFmt=Amount:#,##0.00|UsdEquivalent:#,##0.00|RWA Exposure:0.00%|PaymentDate:yyyy-mm-dd
     If opt.Exists("numfmt") Then
         Dim pairs() As String, p As Variant, colFmt() As String
         Dim colIdx As Long, lastRow As Long
@@ -606,7 +478,7 @@ Sub ApplyOptions(ws As Worksheet, options As String)
     End If
 End Sub
 
-' ========= OPTIONAL: RUN SUBSETS =========
+' ========= OPTIONAL: RUN SUBSETS (Risk-only / Balance-only) =========
 Sub RunRiskPipeline():    RunConfigSubset "Risk Report":            End Sub
 Sub RunBalancePipeline(): RunConfigSubset "Balance Break Report":  End Sub
 
@@ -707,4 +579,110 @@ Function FindCol(ws As Worksheet, header As String) As Long
         End If
     Next i
     FindCol = 0
+End Function
+
+Private Function RowPassesRules(ws As Worksheet, r As Long, _
+                                exBlank As Object, exEqCI As Object, exContCI As Object, _
+                                exEqCS As Object, exContCS As Object, _
+                                incEqCS As Object, incContCS As Object, _
+                                incContCI As Object) As Boolean
+    Dim k As Variant, v As String, lv As String, pat As Variant
+    Dim hit As Boolean
+
+    ' Exclude blanks/whitespace
+    For Each k In exBlank.Keys
+        v = CStr(ws.Cells(r, CLng(k)).Value)
+        If Trim$(v) = "" Then RowPassesRules = False: Exit Function
+    Next k
+
+    ' Exclude equals (case-insensitive)
+    For Each k In exEqCI.Keys
+        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
+        If exEqCI(k).Exists(LCase$(v)) Then RowPassesRules = False: Exit Function
+    Next k
+
+    ' Exclude contains (case-insensitive)
+    For Each k In exContCI.Keys
+        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
+        lv = LCase$(v)
+        For Each pat In exContCI(k).Keys
+            If pat <> "" Then
+                If InStr(1, lv, CStr(pat), vbTextCompare) > 0 Then
+                    RowPassesRules = False: Exit Function
+                End If
+            End If
+        Next pat
+    Next k
+
+    ' Exclude equals (case-sensitive)
+    For Each k In exEqCS.Keys
+        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
+        For Each pat In exEqCS(k).Keys
+            If StrComp(v, CStr(pat), vbBinaryCompare) = 0 Then
+                RowPassesRules = False: Exit Function
+            End If
+        Next pat
+    Next k
+
+    ' Exclude contains (case-sensitive)
+    For Each k In exContCS.Keys
+        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
+        For Each pat In exContCS(k).Keys
+            If pat <> "" Then
+                If InStr(1, v, CStr(pat), vbBinaryCompare) > 0 Then
+                    RowPassesRules = False: Exit Function
+                End If
+            End If
+        Next pat
+    Next k
+
+    ' Include equals (case-sensitive): must match at least one allowed value per column
+    For Each k In incEqCS.Keys
+        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
+        hit = False
+        For Each pat In incEqCS(k).Keys
+            If StrComp(v, CStr(pat), vbBinaryCompare) = 0 Then
+                hit = True: Exit For
+            End If
+        Next pat
+        If Not hit Then RowPassesRules = False: Exit Function
+    Next k
+
+    ' Include contains (case-sensitive): must contain at least one allowed pattern per column
+    For Each k In incContCS.Keys
+        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
+        hit = False
+        For Each pat In incContCS(k).Keys
+            If pat <> "" Then
+                If InStr(1, v, CStr(pat), vbBinaryCompare) > 0 Then
+                    hit = True: Exit For
+                End If
+            End If
+        Next pat
+        If Not hit Then RowPassesRules = False: Exit Function
+    Next k
+
+    ' Include contains (case-insensitive, NEW ~?) -> must hit at least one per column
+    For Each k In incContCI.Keys
+        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
+        lv = LCase$(v)
+        hit = False
+
+        ' allow <blank>
+        If incContCI(k).Exists("__BLANK__") And Trim$(v) = "" Then
+            hit = True
+        Else
+            For Each pat In incContCI(k).Keys
+                If pat <> "__BLANK__" Then
+                    If InStr(1, lv, CStr(pat), vbTextCompare) > 0 Then
+                        hit = True: Exit For
+                    End If
+                End If
+            Next pat
+        End If
+
+        If Not hit Then RowPassesRules = False: Exit Function
+    Next k
+
+    RowPassesRules = True
 End Function
