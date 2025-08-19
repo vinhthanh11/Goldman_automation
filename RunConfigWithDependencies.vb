@@ -477,50 +477,56 @@ Private Function RowPassesRules(ws As Worksheet, r As Long, _
 End Function
 
 ' ========= RENAME HEADERS (robust; ignores missing/dup targets) =========
+' Normalize header text for matching: trim, collapse spaces, remove NBSP, case-insensitive
 Private Function NormHeader(ByVal s As String) As String
     Dim t As String
     t = CStr(s)
-    t = Replace$(t, Chr$(160), " ")                       ' NBSP -> space
-    t = Application.WorksheetFunction.Trim(t)             ' trim + collapse
+    t = Replace$(t, Chr$(160), " ")                 ' NBSP -> space
+    t = Application.WorksheetFunction.Trim(t)       ' trims + collapses multiple spaces
     NormHeader = LCase$(t)
 End Function
 
 Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
-    Const RENAME_ALL_DUPLICATES As Boolean = False
+    Const RENAME_ALL_DUPLICATES As Boolean = False  ' True -> rename all duplicate source headers
 
     Dim pairs() As String, p As Variant, kv() As String
     Dim src As String, dest As String
     Dim srcN As String, destN As String
     Dim lastCol As Long, i As Long
-    Dim headers As Object, seenDest As Object
+    Dim headers As Object          ' norm header -> Collection of column indexes (snapshot)
     Dim colIdxs As Collection
+    Dim seenDest As Object         ' norm dest already present -> column index (any)
     Dim h As String, hN As String
-    Dim vIdx As Variant
+    Dim vIdx As Variant            ' <-- Variant for For Each over Collection
     Dim sameCol As Boolean
 
     renameMap = Trim$(renameMap)
     If renameMap = "" Then Exit Sub
 
     lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+
     Set headers = CreateObject("Scripting.Dictionary")
     Set seenDest = CreateObject("Scripting.Dictionary")
 
-    ' snapshot headers
+    ' ---- snapshot current headers (so renames do NOT cascade) ----
     For i = 1 To lastCol
         h = CStr(ws.Cells(1, i).Value)
         hN = NormHeader(h)
         If Not headers.Exists(hN) Then
             Set colIdxs = New Collection
-            headers(hN) = colIdxs
+            Set headers(hN) = colIdxs          ' <-- USE Set here
         End If
         headers(hN).Add i
+
         If Not seenDest.Exists(hN) Then seenDest(hN) = i
     Next i
 
+    ' ---- process "Original:New" pairs safely ----
     pairs = Split(renameMap, ",")
     For Each p In pairs
         If InStr(p, ":") = 0 Then GoTo NextP
         kv = Split(p, ":", 2)
+
         src = Trim$(kv(0))
         dest = Trim$(kv(1))
         If src = "" Or dest = "" Then GoTo NextP
@@ -528,8 +534,10 @@ Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
         srcN = NormHeader(src)
         destN = NormHeader(dest)
 
+        ' source must exist (in snapshot) — otherwise ignore silently
         If Not headers.Exists(srcN) Then GoTo NextP
 
+        ' if the destination header already exists elsewhere, skip (avoid duplicates)
         If seenDest.Exists(destN) Then
             sameCol = False
             For Each vIdx In headers(srcN)
@@ -538,6 +546,7 @@ Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
             If Not sameCol Then GoTo NextP
         End If
 
+        ' perform rename(s)
         If RENAME_ALL_DUPLICATES Then
             For Each vIdx In headers(srcN)
                 ws.Cells(1, CLng(vIdx)).Value = dest
@@ -545,6 +554,7 @@ Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
         Else
             ws.Cells(1, CLng(headers(srcN)(1))).Value = dest
         End If
+
 NextP:
     Next p
 End Sub
