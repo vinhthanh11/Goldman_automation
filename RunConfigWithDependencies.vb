@@ -357,7 +357,6 @@ Private Sub ApplyRules_OnTarget(rngTgt As Range, colDict As Object, filterRules 
     Dim helperConds As Collection: Set helperConds = New Collection
     Dim colRef As String, cond As String
     Dim lastRow As Long, lastCol As Long, helperCol As Long, f As String
-    Dim i As Long
 
     If Trim$(filterRules) = "" Then Exit Sub
 
@@ -375,11 +374,14 @@ Private Sub ApplyRules_OnTarget(rngTgt As Range, colDict As Object, filterRules 
         fieldName = Trim$(Split(rule, op)(0))
         valueExp  = Trim$(Split(rule, op)(1))
         If Not colDict.Exists(LCase$(fieldName)) Then GoTo NextRule2
+
         fld = CLng(colDict(LCase$(fieldName)))
-        colRef = "$" & ColLetter(fld) & "2" ' absolute col, relative row start
+        If fld < 1 Or fld > lastCol Then GoTo NextRule2
+
+        colRef = "$" & ColLetter(fld) & "2"  ' absolute column, relative row
 
         Select Case op
-            ' ----- UI-capable directly -----
+            ' --- UI-capable directly ---
             Case "="
                 If InStr(valueExp, "|") > 0 Then
                     critArr = Split(valueExp, "|")
@@ -388,27 +390,27 @@ Private Sub ApplyRules_OnTarget(rngTgt As Range, colDict As Object, filterRules 
                     rngTgt.AutoFilter Field:=fld, Criteria1:=valueExp
                 End If
 
-            Case "<>", ">", "<", ">=", "<="
-                rngTgt.AutoFilter Field:=fld, Criteria1:=op & valueExp
-
             Case "~"
                 critArr = Split(valueExp, "|")
                 If UBound(critArr) = 0 Then
                     rngTgt.AutoFilter Field:=fld, Criteria1:="*" & Trim$(critArr(0)) & "*"
+                ElseIf UBound(critArr) = 1 Then
+                    rngTgt.AutoFilter Field:=fld, _
+                        Criteria1:="*" & Trim$(critArr(0)) & "*", _
+                        Operator:=xlOr, _
+                        Criteria2:="*" & Trim$(critArr(1)) & "*"
                 Else
-                    ' if more than two terms, fall back to helper
-                    If UBound(critArr) > 1 Then
-                        cond = BuildContainsCI_OR(colRef, critArr)
-                        helperConds.Add cond
-                    Else
-                        rngTgt.AutoFilter Field:=fld, _
-                            Criteria1:="*" & Trim$(critArr(0)) & "*", _
-                            Operator:=xlOr, _
-                            Criteria2:="*" & Trim$(critArr(1)) & "*"
-                    End If
+                    ' too many contains terms for UI → helper
+                    helperConds.Add BuildContainsCI_OR(colRef, critArr)
                 End If
 
-            ' ----- helper-required (negative / case-sensitive / special) -----
+            Case "<>", ">", "<", ">=", "<="
+                ' try native UI; if it fails, build helper formula
+                If Not TryAutoFilterCompare(rngTgt, fld, op, valueExp) Then
+                    helperConds.Add BuildCompareFormula(colRef, op, valueExp)
+                End If
+
+            ' --- helper-required (negative / case-sensitive / special) ---
             Case "!="
                 If valueExp = "" Then
                     helperConds.Add "LEN(TRIM(" & colRef & "))>0"
@@ -416,8 +418,14 @@ Private Sub ApplyRules_OnTarget(rngTgt As Range, colDict As Object, filterRules 
                     terms = Split(valueExp, "|")
                     helperConds.Add BuildNotEqualsCI_AND(colRef, terms)
                 Else
-                    ' single value can be done via UI, but for consistency we can still use UI:
+                    ' single value: UI usually ok
+                    On Error Resume Next
                     rngTgt.AutoFilter Field:=fld, Criteria1:="<>" & valueExp
+                    If Err.Number <> 0 Then
+                        Err.Clear
+                        helperConds.Add BuildNotEqualsCI_AND(colRef, Split(valueExp, "|"))
+                    End If
+                    On Error GoTo 0
                 End If
 
             Case "!~"
@@ -454,15 +462,13 @@ NextRule2:
 
     ' Add helper if needed
     If helperConds.Count > 0 Then
-        helperCol = lastCol + 1
+        Dim helperCol As Long: helperCol = lastCol + 1
         rngTgt.Worksheet.Cells(1, helperCol).Value = "_FilterPass"
         f = "=AND(" & JoinCollection(helperConds, ",") & ")"
         rngTgt.Worksheet.Cells(2, helperCol).Formula = f
-        rngTgt.Worksheet.Cells(2, helperCol).AutoFill _
-            Destination:=rngTgt.Worksheet.Range(rngTgt.Worksheet.Cells(2, helperCol), rngTgt.Worksheet.Cells(lastRow, helperCol))
-        ' filter to TRUE on helper
+        rngTgt.Worksheet.Range(rngTgt.Worksheet.Cells(2, helperCol), _
+                               rngTgt.Worksheet.Cells(lastRow, helperCol)).FillDown
         rngTgt.Resize(, helperCol).AutoFilter Field:=helperCol, Criteria1:="=TRUE"
-        ' optional: hide helper column
         rngTgt.Worksheet.Columns(helperCol).Hidden = True
     End If
 End Sub
@@ -1014,3 +1020,60 @@ Private Function RowPassesRules(ws As Worksheet, r As Long, _
 
     RowPassesRules = True
 End Function
+                                                                                                                                                                                                    
+Private Function TryAutoFilterCompare(rngTgt As Range, fld As Long, op As String, valueExp As String) As Boolean
+    On Error GoTo FailFast
+
+    ' Exclude blanks: "<>" (no value) is valid
+    If op = "<>" And Len(valueExp) = 0 Then
+        rngTgt.AutoFilter Field:=fld, Criteria1:="<>"
+        TryAutoFilterCompare = True
+        Exit Function
+    End If
+
+    ' Try numeric
+    If IsNumeric(valueExp) Then
+        rngTgt.AutoFilter Field:=fld, Criteria1:=op & CDbl(valueExp)
+        TryAutoFilterCompare = True
+        Exit Function
+    End If
+
+    ' Try date
+    If IsDate(valueExp) Then
+        rngTgt.AutoFilter Field:=fld, Criteria1:=op & CLng(CDate(valueExp))
+        TryAutoFilterCompare = True
+        Exit Function
+    End If
+
+    ' Fallback as text
+    rngTgt.AutoFilter Field:=fld, Criteria1:=op & valueExp
+    TryAutoFilterCompare = True
+    Exit Function
+
+FailFast:
+    TryAutoFilterCompare = False
+End Function
+
+Private Function BuildCompareFormula(colRef As String, op As String, valueExp As String) As String
+    Dim d As String
+    If op = "<>" Then
+        If Len(valueExp) = 0 Then
+            BuildCompareFormula = "LEN(TRIM(" & colRef & "))>0"
+        Else
+            BuildCompareFormula = "LOWER(TRIM(" & colRef & "))<>" & EscQ(LCase$(valueExp))
+        End If
+        Exit Function
+    End If
+
+    If IsDate(valueExp) Then
+        d = Format$(CDate(valueExp), "yyyy-mm-dd")
+        BuildCompareFormula = "IFERROR(DATEVALUE(TRIM(" & colRef & ")),N(" & colRef & "))" & _
+                              op & "DATEVALUE(" & EscQ(d) & ")"
+    ElseIf IsNumeric(valueExp) Then
+        BuildCompareFormula = "VALUE(SUBSTITUTE(TRIM(" & colRef & "),"","""",""""))" & op & CStr(CDbl(valueExp))
+    Else
+        ' textual comparison (case-insensitive)
+        BuildCompareFormula = "LOWER(TRIM(" & colRef & "))" & op & "LOWER(" & EscQ(valueExp) & ")"
+    End If
+End Function
+                                                                                                                                                                            
