@@ -7,8 +7,8 @@ Option Explicit
 ' C: ParentReport    (upstream sheet name, or blank if base)
 ' D: FilterRules     (see operator guide below)
 ' E: KeepColumns     (CSV of headers to copy, in order; use SOURCE header names)
-' F: RenameMap       (CSV of "Original:New" pairs; missing originals are ignored)
-' G: Options         (e.g. "HeadersBold=True;AutoFit=True;NumFmt=Amount:#,##0.00|RWA Exposure:0.00%")
+' F: RenameMap       (CSV of "Original:New" pairs; supports multi-origin "A|B:New")
+' G: Options         (e.g. "HeadersBold=True;AutoFit=True;NumFmt=Amount:#,##0.00|RWA Exposure:0.00%;FlagOnly=True;FlagColumn=Include?")
 ' =========================
 
 ' ========= MAIN (runs everything per Config) =========
@@ -19,6 +19,7 @@ Sub RunConfigWithDependencies()
     Dim filterRules As String, keepCols As String, renameMap As String, options As String
     Dim wsInput As Worksheet, wsTarget As Worksheet
     Dim scrn As Boolean, calc As XlCalculation
+    Dim opt As Object, isFlagOnly As Boolean
 
     ' optional speed-ups
     scrn = Application.ScreenUpdating: Application.ScreenUpdating = False
@@ -52,10 +53,21 @@ Sub RunConfigWithDependencies()
         ' Ensure target exists
         Set wsTarget = GetOrCreateSheet(sheetName)
 
+        ' Parse options to check for FlagOnly
+        Set opt = ParseOptions(options)
+        isFlagOnly = False
+        If Not opt Is Nothing Then
+            If opt.Exists("flagonly") Then isFlagOnly = CBool(ValueAsBool(opt("flagonly")))
+        End If
+
         ' Process
-        FilterAndCopy_Flex wsInput, wsTarget, filterRules, keepCols
-        ApplyRenameMap     wsTarget, renameMap
-        ApplyOptions       wsTarget, options
+        FilterAndCopy_Flex wsInput, wsTarget, filterRules, keepCols, options
+
+        ' In FlagOnly mode we only wrote a flag to the source sheet; skip target formatting
+        If Not isFlagOnly Then
+            ApplyRenameMap     wsTarget, renameMap
+            ApplyOptions       wsTarget, options
+        End If
 NextItem:
     Next i
 
@@ -117,7 +129,7 @@ Function GetExecutionOrder(wsConfig As Worksheet) As Collection
     End If
 End Function
 
-' ========= FILTER + COPY (ALL visible rows; supports advanced operators) =========
+' ========= FILTER + COPY (ALL visible rows; supports advanced operators and FlagOnly) =========
 ' Operators (AND across rules; OR within value via "|"):
 '   =    equals (CI, OR via "|")
 '   <>   not equal (single value, CI)
@@ -129,12 +141,13 @@ End Function
 '   ~^   contains (case-sensitive, any # terms)
 '   !=^  not equal (case-sensitive, OR). `Status!=^` excludes blanks/spaces
 '   !~^  does NOT contain (case-sensitive, any # terms)
-'   ~?   contains (case-insensitive include, unlimited OR, supports `<blank>`)  ← NEW
+'   ~?   contains (case-insensitive include, unlimited OR, supports `<blank>`)
 '
 ' Example (include blanks OR “Not sent” OR “SLC” in LatestComment, CI):
 '   Setts_Input Field_LatestComment~?Not sent|SLC|<blank>
 Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
-                       filterRules As String, keepCols As String)
+                       filterRules As String, keepCols As String, _
+                       Optional options As String = "")
 
     Dim colDict As Object, rules() As String, rule As Variant
     Dim lastRow As Long, lastCol As Long
@@ -154,6 +167,23 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     Dim dictTmp As Object
     Dim v As Variant, p As Variant
 
+    ' --- options (FlagOnly) ---
+    Dim opt As Object
+    Dim flagOnly As Boolean, flagColName As String, flagYes As String, flagNo As String
+
+    Set opt = ParseOptions(options)
+    flagOnly = False: flagColName = "Include?": flagYes = "Yes": flagNo = "No"
+    If Not opt Is Nothing Then
+        If opt.Exists("flagonly") Then flagOnly = CBool(ValueAsBool(opt("flagonly")))
+        If opt.Exists("flagcolumn") Then If Trim$(opt("flagcolumn")) <> "" Then flagColName = Trim$(opt("flagcolumn"))
+        If opt.Exists("flagyes") Then If Trim$(opt("flagyes")) <> "" Then flagYes = Trim$(opt("flagyes"))
+        If opt.Exists("flagn o") Then ' typo-proofing, just in case
+            If Trim$(opt("flagn o")) <> "" Then flagNo = Trim$(opt("flagn o"))
+        ElseIf opt.Exists("flagno") Then
+            If Trim$(opt("flagno")) <> "" Then flagNo = Trim$(opt("flagno"))
+        End If
+    End If
+
     Set exBlank   = CreateObject("Scripting.Dictionary")
     Set exEqCI    = CreateObject("Scripting.Dictionary")
     Set exContCI  = CreateObject("Scripting.Dictionary")
@@ -161,7 +191,7 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     Set exContCS  = CreateObject("Scripting.Dictionary")
     Set incEqCS   = CreateObject("Scripting.Dictionary")
     Set incContCS = CreateObject("Scripting.Dictionary")
-    Set incContCI = CreateObject("Scripting.Dictionary") ' NEW
+    Set incContCI = CreateObject("Scripting.Dictionary")
 
     Set colDict = CreateObject("Scripting.Dictionary")
 
@@ -179,7 +209,7 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     Next c
 
     ' Prep
-    wsTarget.Cells.Clear
+    If Not flagOnly Then wsTarget.Cells.Clear
     If wsSource.AutoFilterMode Then wsSource.AutoFilterMode = False
     rngData.AutoFilter
 
@@ -197,7 +227,7 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
                 Case InStr(rule, "!~^") > 0: op = "!~^"
                 Case InStr(rule, "=^")  > 0: op = "=^"
                 Case InStr(rule, "~^")  > 0: op = "~^"
-                Case InStr(rule, "~?")  > 0: op = "~?"   ' NEW include CI
+                Case InStr(rule, "~?")  > 0: op = "~?"
                 Case InStr(rule, "!=")  > 0: op = "!="
                 Case InStr(rule, "!~")  > 0: op = "!~"
                 Case InStr(rule, "<>")  > 0: op = "<>"
@@ -343,6 +373,48 @@ NextRule:
         Exit Sub
     End If
 
+    ' ---------- FLAG ONLY MODE ----------
+    If flagOnly Then
+        Dim visibleRow As Object, ar As Range, rr As Range, r As Long
+        Set visibleRow = CreateObject("Scripting.Dictionary")
+
+        ' collect visible rows after AutoFilter
+        For Each ar In vis.Areas
+            For Each rr In ar.Rows
+                visibleRow(rr.Row) = True
+            Next rr
+        Next ar
+
+        ' ensure/create flag column on SOURCE
+        Dim flagColIdx As Long, srcLastCol As Long
+        srcLastCol = wsSource.Cells(1, wsSource.Columns.Count).End(xlToLeft).Column
+        flagColIdx = FindCol(wsSource, flagColName)
+        If flagColIdx = 0 Then
+            flagColIdx = srcLastCol + 1
+            wsSource.Cells(1, flagColIdx).Value = flagColName
+        Else
+            ' clear old flags
+            wsSource.Range(wsSource.Cells(2, flagColIdx), wsSource.Cells(lastRow, flagColIdx)).ClearContents
+        End If
+
+        ' mark Yes/No
+        For r = 2 To lastRow
+            If visibleRow.Exists(r) And RowPassesRules(wsSource, r, _
+                                                       exBlank, exEqCI, exContCI, _
+                                                       exEqCS, exContCS, _
+                                                       incEqCS, incContCS, _
+                                                       incContCI) Then
+                wsSource.Cells(r, flagColIdx).Value = flagYes
+            Else
+                wsSource.Cells(r, flagColIdx).Value = flagNo
+            End If
+        Next r
+
+        wsSource.AutoFilterMode = False
+        Exit Sub
+    End If
+    ' ---------- END FLAG ONLY MODE ----------
+
     ' Copy requested columns, enforcing row-level includes/excludes
     colArr = Split(keepCols, ",")
     pasteCol = 1
@@ -352,7 +424,6 @@ NextRule:
         If colDict.Exists(LCase(Trim(colArr(c)))) Then
             srcColIdx = colDict(LCase(Trim(colArr(c))))
         Else
-            ' Uncomment for diagnostics:
             ' Debug.Print "Skip missing keep column in source: [" & Trim(colArr(c)) & "] on sheet " & wsSource.Name
         End If
         If srcColIdx = 0 Then GoTo NextKeep
@@ -384,12 +455,13 @@ NextKeep:
     wsSource.AutoFilterMode = False
 End Sub
 
-' ========= RENAME HEADERS (safe: ignore missing originals; avoid collisions) =========
+' ========= RENAME HEADERS (safe: ignore missing originals; avoid collisions; supports multi-origin "A|B:New") =========
 Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
     Dim mapArr() As String, pair As Variant
-    Dim orig As String, newName As String
+    Dim leftPart As String, newName As String
+    Dim candidates() As String, cand As Variant
     Dim lastCol As Long, i As Long
-    Dim hdrDict As Object, colIdx As Variant
+    Dim hdrDict As Object, colIdx As Variant, foundIdx As Variant
 
     If Trim$(renameMap) = "" Then Exit Sub
 
@@ -404,49 +476,57 @@ Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
     For Each pair In mapArr
         pair = Trim$(CStr(pair))
         If pair <> "" And InStr(pair, ":") > 0 Then
-            orig = Trim$(Split(pair, ":", 2)(0))
-            newName = Trim$(Split(pair, ":", 2)(1))
+            leftPart = Trim$(Split(pair, ":", 2)(0))  ' may be "A|B|C"
+            newName  = Trim$(Split(pair, ":", 2)(1))
+            If newName = "" Then GoTo NextPair
 
-            If orig <> "" And newName <> "" Then
-                If hdrDict.Exists(LCase$(orig)) Then
-                    colIdx = hdrDict(LCase$(orig))
+            foundIdx = Empty
+            candidates = Split(leftPart, "|")
 
-                    ' avoid collision: if new header exists on different col, skip
-                    If hdrDict.Exists(LCase$(newName)) And hdrDict(LCase$(newName)) <> colIdx Then
-                        ' skip silently
-                    Else
-                        ws.Cells(1, CLng(colIdx)).Value = newName
-                        ' update dictionary
-                        hdrDict.Remove LCase$(orig)
-                        hdrDict(LCase$(newName)) = colIdx
+            ' find the first original that actually exists in the current headers
+            For Each cand In candidates
+                cand = Trim$(CStr(cand))
+                If cand <> "" Then
+                    If hdrDict.Exists(LCase$(cand)) Then
+                        foundIdx = hdrDict(LCase$(cand))
+                        Exit For
                     End If
-                Else
-                    ' original not present -> ignore mapping
                 End If
+            Next cand
+
+            If Not IsEmpty(foundIdx) Then
+                colIdx = CLng(foundIdx)
+                ' Avoid collision: if new header already exists on different col, skip
+                If hdrDict.Exists(LCase$(newName)) And hdrDict(LCase$(newName)) <> colIdx Then
+                    ' skip silently
+                Else
+                    ws.Cells(1, colIdx).Value = newName
+                    ' update dictionary: remove any matched originals; then add new
+                    For Each cand In candidates
+                        cand = Trim$(CStr(cand))
+                        If cand <> "" Then
+                            If hdrDict.Exists(LCase$(cand)) And hdrDict(LCase$(cand)) = colIdx Then
+                                hdrDict.Remove LCase$(cand)
+                            End If
+                        End If
+                    Next cand
+                    hdrDict(LCase$(newName)) = colIdx
+                End If
+            Else
+                ' none of the originals exist → ignore mapping
             End If
         End If
+NextPair:
     Next pair
 End Sub
 
-' ========= OPTIONS: headers, autofit, freeze, number formats by header =========
+' ========= OPTIONS: headers, autofit, freeze, number formats by header, comma styles =========
 Sub ApplyOptions(ws As Worksheet, options As String)
-    Dim optArr() As String, kv() As String, i As Long
-    Dim opt As Object: Set opt = CreateObject("Scripting.Dictionary")
-    If Trim$(options) = "" Then Exit Sub
+    Dim opt As Object, pairs() As String, p As Variant, colFmt() As String
+    Dim colIdx As Long, lastRow As Long
 
-    ' Parse: "Key=Value;Flag;Key2=Value2"
-    optArr = Split(options, ";")
-    For i = LBound(optArr) To UBound(optArr)
-        optArr(i) = Trim$(optArr(i))
-        If optArr(i) <> "" Then
-            If InStr(optArr(i), "=") > 0 Then
-                kv = Split(optArr(i), "=", 2)
-                opt(LCase$(Trim$(kv(0)))) = Trim$(kv(1))
-            Else
-                opt(LCase$(optArr(i))) = True
-            End If
-        End If
-    Next i
+    Set opt = ParseOptions(options)
+    If opt Is Nothing Then Exit Sub
 
     If opt.Exists("headersbold") Then
         ws.Rows(1).Font.Bold = True
@@ -461,11 +541,8 @@ Sub ApplyOptions(ws As Worksheet, options As String)
     ' Number formats by header (after renaming)
     ' Syntax: NumFmt=Amount:#,##0.00|UsdEquivalent:#,##0.00|RWA Exposure:0.00%|PaymentDate:yyyy-mm-dd
     If opt.Exists("numfmt") Then
-        Dim pairs() As String, p As Variant, colFmt() As String
-        Dim colIdx As Long, lastRow As Long
-        pairs = Split(opt("numfmt"), "|")
+        pairs = Split(CStr(opt("numfmt")), "|")
         lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
-
         For Each p In pairs
             If InStr(p, ":") > 0 Then
                 colFmt = Split(p, ":", 2)
@@ -475,6 +552,14 @@ Sub ApplyOptions(ws As Worksheet, options As String)
                 End If
             End If
         Next p
+    End If
+
+    ' Comma styles
+    If opt.Exists("commastyle") Then
+        ApplyCommaStyleToHeaders ws, CStr(opt("commastyle")), False
+    End If
+    If opt.Exists("commastyle0") Then
+        ApplyCommaStyleToHeaders ws, CStr(opt("commastyle0")), True
     End If
 End Sub
 
@@ -488,6 +573,7 @@ Sub RunConfigSubset(startSheet As String)
     Dim sheetName As String, sourceName As String, parentName As String
     Dim filterRules As String, keepCols As String, renameMap As String, options As String
     Dim wsInput As Worksheet, wsTarget As Worksheet
+    Dim opt As Object, isFlagOnly As Boolean
 
     Set wsConfig = ThisWorkbook.Sheets("Config")
     Set order = GetExecutionOrder(wsConfig)
@@ -519,9 +605,19 @@ Sub RunConfigSubset(startSheet As String)
         If wsInput Is Nothing Then GoTo NextItem
 
         Set wsTarget = GetOrCreateSheet(sheetName)
-        FilterAndCopy_Flex wsInput, wsTarget, filterRules, keepCols
-        ApplyRenameMap     wsTarget, renameMap
-        ApplyOptions       wsTarget, options
+
+        ' parse FlagOnly
+        Set opt = ParseOptions(options)
+        isFlagOnly = False
+        If Not opt Is Nothing Then
+            If opt.Exists("flagonly") Then isFlagOnly = CBool(ValueAsBool(opt("flagonly")))
+        End If
+
+        FilterAndCopy_Flex wsInput, wsTarget, filterRules, keepCols, options
+        If Not isFlagOnly Then
+            ApplyRenameMap     wsTarget, renameMap
+            ApplyOptions       wsTarget, options
+        End If
 NextItem:
     Next i
 End Sub
@@ -662,7 +758,7 @@ Private Function RowPassesRules(ws As Worksheet, r As Long, _
         If Not hit Then RowPassesRules = False: Exit Function
     Next k
 
-    ' Include contains (case-insensitive, NEW ~?) -> must hit at least one per column
+    ' Include contains (case-insensitive, ~?) -> must hit at least one per column
     For Each k In incContCI.Keys
         v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
         lv = LCase$(v)
@@ -686,3 +782,63 @@ Private Function RowPassesRules(ws As Worksheet, r As Long, _
 
     RowPassesRules = True
 End Function
+
+' --- Options parsing + helpers ---
+Private Function ParseOptions(options As String) As Object
+    Dim d As Object, arr() As String, i As Long, kv() As String, tok As String
+    If Trim$(options) = "" Then Exit Function
+    Set d = CreateObject("Scripting.Dictionary")
+    arr = Split(options, ";")
+    For i = LBound(arr) To UBound(arr)
+        tok = Trim$(arr(i))
+        If tok <> "" Then
+            If InStr(tok, "=") > 0 Then
+                kv = Split(tok, "=", 2)
+                d(LCase$(Trim$(kv(0)))) = Trim$(kv(1))
+            Else
+                d(LCase$(tok)) = True
+            End If
+        End If
+    Next i
+    Set ParseOptions = d
+End Function
+
+Private Function ValueAsBool(v As Variant) As Boolean
+    Dim s As String
+    If VarType(v) = vbBoolean Then
+        ValueAsBool = v
+    Else
+        s = LCase$(Trim$(CStr(v)))
+        ValueAsBool = (s = "true" Or s = "yes" Or s = "1" Or s = "y")
+    End If
+End Function
+
+' --- Comma style helper ---
+Private Sub ApplyCommaStyleToHeaders(ws As Worksheet, headersList As String, zeroDecimals As Boolean)
+    Dim arr() As String, h As Variant
+    Dim colIdx As Long, lastRow As Long
+    Dim rng As Range, styleName As String
+
+    If Trim$(headersList) = "" Then Exit Sub
+    arr = Split(headersList, "|")
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+
+    For Each h In arr
+        colIdx = FindCol(ws, Trim$(CStr(h))) ' uses final (post-rename) headers
+        If colIdx > 0 Then
+            Set rng = ws.Range(ws.Cells(2, colIdx), ws.Cells(Application.Max(2, lastRow), colIdx))
+            styleName = IIf(zeroDecimals, "Comma [0]", "Comma")
+            On Error Resume Next
+            rng.Style = styleName                     ' try built-in style
+            If Err.Number <> 0 Then                  ' fallback (localized Excel)
+                Err.Clear
+                If zeroDecimals Then
+                    rng.NumberFormat = "#,##0"
+                Else
+                    rng.NumberFormat = "#,##0.00"
+                End If
+            End If
+            On Error GoTo 0
+        End If
+    Next h
+End Sub
