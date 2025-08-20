@@ -144,6 +144,9 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     Dim uiMode As String
     Dim opts As Object
 
+    ' >>> FIX: declare pasteCol once here <<<
+    Dim pasteCol As Long
+
     Set opts = ParseOptions(options)
     uiMode = ""
     If Not opts Is Nothing Then
@@ -164,7 +167,7 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     If uiMode = "all" Or uiMode = "keep" Then
         Dim colDictSrc As Object: Set colDictSrc = HeaderDict(wsSource, lastCol)
         Dim colDictTgt As Object
-        Dim keepArr() As String, k As Long, pasteCol As Long, srcIdx As Long
+        Dim keepArr() As String, k As Long, srcIdx As Long  ' <<< removed pasteCol here
         Dim lastColT As Long, lastRowT As Long
         Dim rngTgt As Range
 
@@ -212,13 +215,13 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
         Exit Sub
     End If
 
-    ' ------ default branch: non-UI (previous behavior: filter source + copy visible subset) ------
+    ' ------ default branch: non-UI (filter source + copy visible subset) ------
     Dim colDictSrc2 As Object: Set colDictSrc2 = HeaderDict(wsSource, lastCol)
     Dim rngVisible As Range, c As Long
     Dim rules() As String, rule As Variant
     Dim fieldName As String, op As String, valueExp As String
     Dim critArr() As String
-    Dim colArr() As String, pasteCol As Long, srcColIdx As Long
+    Dim colArr() As String, srcColIdx As Long     ' <<< removed pasteCol here
     Dim area As Range, cell As Range, destRow As Long
 
     ' collections for row-level checks
@@ -242,7 +245,7 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     If Len(Trim$(filterRules)) > 0 Then
         rules = Split(filterRules, ";")
         For Each rule In rules
-            rule = Trim$(CStr(rule))
+            rule = Trim(CStr(rule))
             If Len(rule) = 0 Then GoTo NextRule1
 
             op = DetectOp(rule)
@@ -255,49 +258,16 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
             Dim fld As Long: fld = colDictSrc2(LCase$(fieldName))
 
             Select Case op
-                Case "=^"
-                    SetDictAdd incEqCS, fld, valueExp, True
-                Case "~^"
-                    SetDictAdd incContCS, fld, valueExp, True
-                Case "~?"
-                    SetDictAddCI_WithBlank incContCI, fld, valueExp
-                Case "!=^"
-                    If valueExp = "" Then
-                        exBlank(fld) = True
-                    Else
-                        SetDictAdd exEqCS, fld, valueExp, True
-                    End If
-                Case "!~^"
-                    SetDictAdd exContCS, fld, valueExp, True
-                Case "!="
-                    If valueExp = "" Then
-                        exBlank(fld) = True
-                    ElseIf InStr(valueExp, "|") > 0 Then
-                        SetDictAddCI exEqCI, fld, valueExp
-                    Else
-                        rngSrc.AutoFilter Field:=fld, Criteria1:="<>" & valueExp
-                    End If
-                Case "!~"
-                    SetDictAddCI exContCI, fld, valueExp
-                Case "="
-                    If InStr(valueExp, "|") > 0 Then
-                        critArr = Split(valueExp, "|")
-                        rngSrc.AutoFilter Field:=fld, Criteria1:=critArr, Operator:=xlFilterValues
-                    Else
-                        rngSrc.AutoFilter Field:=fld, Criteria1:=valueExp
-                    End If
-                Case "<>", ">", "<", ">=", "<="
-                    rngSrc.AutoFilter Field:=fld, Criteria1:=op & valueExp
-                Case "~"
-                    critArr = Split(valueExp, "|")
-                    If UBound(critArr) = 0 Then
-                        rngSrc.AutoFilter Field:=fld, Criteria1:="*" & Trim$(critArr(0)) & "*"
-                    Else
-                        rngSrc.AutoFilter Field:=fld, _
-                                          Criteria1:="*" & Trim$(critArr(0)) & "*", _
-                                          Operator:=xlOr, _
-                                          Criteria2:="*" & Trim$(critArr(1)) & "*"
-                    End If
+                Case "=^":      SetDictAdd incEqCS, fld, valueExp, True
+                Case "~^":      SetDictAdd incContCS, fld, valueExp, True
+                Case "~?":      SetDictAddCI_WithBlank incContCI, fld, valueExp
+                Case "!=^":     If valueExp = "" Then exBlank(fld) = True Else SetDictAdd exEqCS, fld, valueExp, True
+                Case "!~^":     SetDictAdd exContCS, fld, valueExp, True
+                Case "!=":      If valueExp = "" Then exBlank(fld) = True ElseIf InStr(valueExp, "|") > 0 Then SetDictAddCI exEqCI, fld, valueExp Else rngSrc.AutoFilter Field:=fld, Criteria1:="<>" & valueExp
+                Case "!~":      SetDictAddCI exContCI, fld, valueExp
+                Case "=":       If InStr(valueExp, "|") > 0 Then critArr = Split(valueExp, "|"): rngSrc.AutoFilter Field:=fld, Criteria1:=critArr, Operator:=xlFilterValues Else rngSrc.AutoFilter Field:=fld, Criteria1:=valueExp
+                Case "<>", ">", "<", ">=", "<=": rngSrc.AutoFilter Field:=fld, Criteria1:=op & valueExp
+                Case "~":       critArr = Split(valueExp, "|"): If UBound(critArr) = 0 Then rngSrc.AutoFilter Field:=fld, Criteria1:="*" & Trim$(critArr(0)) & "*" Else rngSrc.AutoFilter Field:=fld, Criteria1:="*" & Trim$(critArr(0)) & "*", Operator:=xlOr, Criteria2:="*" & Trim$(critArr(1)) & "*"
             End Select
 NextRule1:
         Next rule
@@ -347,6 +317,7 @@ NextKeep:
 
     wsSource.AutoFilterMode = False
 End Sub
+
 
 ' ======== Apply rules on TARGET (UI mode): use native AutoFilter + helper column for residuals ========
 Private Sub ApplyRules_OnTarget(rngTgt As Range, colDict As Object, filterRules As String)
