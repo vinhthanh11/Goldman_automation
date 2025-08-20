@@ -6,9 +6,13 @@ Option Explicit
 ' B: Source          (raw sheet name, or blank if dependent)
 ' C: ParentReport    (upstream sheet name, or blank if base)
 ' D: FilterRules     (see operator guide below)
-' E: KeepColumns     (CSV of headers to copy, in order; use SOURCE header names)
+' E: KeepColumns     (CSV of headers to copy, in order; use INPUT's current headers)
 ' F: RenameMap       (CSV of "Original:New" pairs; supports multi-origin "A|B:New")
-' G: Options         (e.g. "HeadersBold=True;AutoFit=True;NumFmt=Amount:#,##0.00|RWA Exposure:0.00%;FlagOnly=True;FlagColumn=Include?")
+' G: Options         (e.g. "HeadersBold=True;AutoFit=True;NumFmt=Amount:#,##0.00;FilterEngine=Arrow;InputMode=ParentSource")
+'
+' Filter engines / inputs:
+'   Options: FilterEngine=Hybrid|Arrow   (default Hybrid)
+'            InputMode=ParentFinal|ParentSource|RootSource   (default ParentFinal)
 ' =========================
 
 ' ========= MAIN (runs everything per Config) =========
@@ -18,8 +22,8 @@ Sub RunConfigWithDependencies()
     Dim sheetName As String, sourceName As String, parentName As String
     Dim filterRules As String, keepCols As String, renameMap As String, options As String
     Dim wsInput As Worksheet, wsTarget As Worksheet
+    Dim filterEngine As String
     Dim scrn As Boolean, calc As XlCalculation
-    Dim opt As Object, isFlagOnly As Boolean
 
     ' optional speed-ups
     scrn = Application.ScreenUpdating: Application.ScreenUpdating = False
@@ -40,40 +44,70 @@ Sub RunConfigWithDependencies()
         keepCols    = CStr(wsConfig.Cells(cfgRow, 5).Value)
         renameMap   = CStr(wsConfig.Cells(cfgRow, 6).Value)
         options     = CStr(wsConfig.Cells(cfgRow, 7).Value)
+        filterEngine = LCase$(GetOptionStr(options, "filterengine", "hybrid"))
 
-        ' Decide input sheet
-        Set wsInput = Nothing
-        If sourceName <> "" Then
-            If SheetExists(sourceName) Then Set wsInput = ThisWorkbook.Sheets(sourceName)
-        ElseIf parentName <> "" Then
-            If SheetExists(parentName) Then Set wsInput = ThisWorkbook.Sheets(parentName)
-        End If
+        ' Resolve input sheet based on InputMode
+        Set wsInput = ResolveInputWorksheet(wsConfig, sourceName, parentName, options)
         If wsInput Is Nothing Then GoTo NextItem
 
         ' Ensure target exists
         Set wsTarget = GetOrCreateSheet(sheetName)
 
-        ' Parse options to check for FlagOnly
-        Set opt = ParseOptions(options)
-        isFlagOnly = False
-        If Not opt Is Nothing Then
-            If opt.Exists("flagonly") Then isFlagOnly = CBool(ValueAsBool(opt("flagonly")))
-        End If
-
         ' Process
-        FilterAndCopy_Flex wsInput, wsTarget, filterRules, keepCols, options
-
-        ' In FlagOnly mode we only wrote a flag to the source sheet; skip target formatting
-        If Not isFlagOnly Then
-            ApplyRenameMap     wsTarget, renameMap
-            ApplyOptions       wsTarget, options
-        End If
+        FilterAndCopy_Flex wsInput, wsTarget, filterRules, keepCols, filterEngine
+        ApplyRenameMap     wsTarget, renameMap
+        ApplyOptions       wsTarget, options
 NextItem:
     Next i
 
 Cleanup:
     Application.ScreenUpdating = scrn
     Application.Calculation = calc
+End Sub
+
+' ========= OPTIONAL: RUN SUBSETS (Risk-only / Balance-only) =========
+Sub RunRiskPipeline():    RunConfigSubset "Risk Report":            End Sub
+Sub RunBalancePipeline(): RunConfigSubset "Balance Break Report":  End Sub
+
+Sub RunConfigSubset(startSheet As String)
+    Dim wsConfig As Worksheet, order As Collection
+    Dim allowed As Object, i As Long, cfgRow As Long
+    Dim sheetName As String, sourceName As String, parentName As String
+    Dim filterRules As String, keepCols As String, renameMap As String, options As String
+    Dim wsInput As Worksheet, wsTarget As Worksheet
+    Dim filterEngine As String
+
+    Set wsConfig = ThisWorkbook.Sheets("Config")
+    Set order = GetExecutionOrder(wsConfig)
+    If order Is Nothing Then Exit Sub
+
+    Set allowed = CreateObject("Scripting.Dictionary")
+    CollectDependents wsConfig, startSheet, allowed
+
+    For i = 1 To order.Count
+        sheetName = CStr(order(i))
+        If Not allowed.Exists(sheetName) Then GoTo NextItem
+
+        cfgRow = FindConfigRow(wsConfig, sheetName)
+        If cfgRow = 0 Then GoTo NextItem
+
+        sourceName = Trim(CStr(wsConfig.Cells(cfgRow, 2).Value))
+        parentName = Trim(CStr(wsConfig.Cells(cfgRow, 3).Value))
+        filterRules = CStr(wsConfig.Cells(cfgRow, 4).Value)
+        keepCols    = CStr(wsConfig.Cells(cfgRow, 5).Value)
+        renameMap   = CStr(wsConfig.Cells(cfgRow, 6).Value)
+        options     = CStr(wsConfig.Cells(cfgRow, 7).Value)
+        filterEngine = LCase$(GetOptionStr(options, "filterengine", "hybrid"))
+
+        Set wsInput = ResolveInputWorksheet(wsConfig, sourceName, parentName, options)
+        If wsInput Is Nothing Then GoTo NextItem
+
+        Set wsTarget = GetOrCreateSheet(sheetName)
+        FilterAndCopy_Flex wsInput, wsTarget, filterRules, keepCols, filterEngine
+        ApplyRenameMap     wsTarget, renameMap
+        ApplyOptions       wsTarget, options
+NextItem:
+    Next i
 End Sub
 
 ' ========= DEPENDENCY RESOLVER (topological sort) =========
@@ -129,7 +163,81 @@ Function GetExecutionOrder(wsConfig As Worksheet) As Collection
     End If
 End Function
 
-' ========= FILTER + COPY (ALL visible rows; supports advanced operators and FlagOnly) =========
+' ========= OPTIONS PARSING & INPUT RESOLUTION =========
+Function GetOptionStr(options As String, key As String, Optional defaultValue As String = "") As String
+    Dim parts() As String, i As Long, kv() As String
+    GetOptionStr = defaultValue
+    If Len(Trim$(options)) = 0 Then Exit Function
+    parts = Split(options, ";")
+    For i = LBound(parts) To UBound(parts)
+        parts(i) = Trim$(parts(i))
+        If parts(i) <> "" And InStr(parts(i), "=") > 0 Then
+            kv = Split(parts(i), "=", 2)
+            If LCase$(Trim$(kv(0))) = LCase$(key) Then
+                GetOptionStr = Trim$(kv(1))
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+Function ResolveInputWorksheet(wsConfig As Worksheet, sourceName As String, parentName As String, options As String) As Worksheet
+    Dim mode As String: mode = LCase$(GetOptionStr(options, "inputmode", "parentfinal"))
+    Dim prow As Long, cur As String, s As String, p As String
+    Dim seen As Object: Set seen = CreateObject("Scripting.Dictionary")
+
+    ' If this row has a direct Source, that's the base case
+    If sourceName <> "" Then
+        If SheetExists(sourceName) Then Set ResolveInputWorksheet = ThisWorkbook.Sheets(sourceName)
+        Exit Function
+    End If
+
+    If parentName = "" Then Exit Function
+
+    Select Case mode
+        Case "parentfinal"
+            If SheetExists(parentName) Then Set ResolveInputWorksheet = ThisWorkbook.Sheets(parentName)
+
+        Case "parentsource"
+            prow = FindConfigRow(wsConfig, parentName)
+            If prow > 0 Then
+                s = Trim$(CStr(wsConfig.Cells(prow, 2).Value)) ' parent's Source
+                If s <> "" And SheetExists(s) Then
+                    Set ResolveInputWorksheet = ThisWorkbook.Sheets(s)
+                    Exit Function
+                End If
+            End If
+            If SheetExists(parentName) Then Set ResolveInputWorksheet = ThisWorkbook.Sheets(parentName)
+
+        Case "rootsource"
+            cur = parentName
+            Do While cur <> ""
+                If seen.Exists(LCase$(cur)) Then Exit Do
+                seen(LCase$(cur)) = True
+
+                prow = FindConfigRow(wsConfig, cur)
+                If prow = 0 Then Exit Do
+
+                s = Trim$(CStr(wsConfig.Cells(prow, 2).Value)) ' Source
+                p = Trim$(CStr(wsConfig.Cells(prow, 3).Value)) ' ParentReport
+
+                If s <> "" Then
+                    If SheetExists(s) Then Set ResolveInputWorksheet = ThisWorkbook.Sheets(s)
+                    Exit Function
+                ElseIf p <> "" Then
+                    cur = p
+                Else
+                    Exit Do
+                End If
+            Loop
+            If SheetExists(parentName) Then Set ResolveInputWorksheet = ThisWorkbook.Sheets(parentName)
+
+        Case Else
+            If SheetExists(parentName) Then Set ResolveInputWorksheet = ThisWorkbook.Sheets(parentName)
+    End Select
+End Function
+
+' ========= FILTER + COPY (ALL visible rows; Arrow or Hybrid engines) =========
 ' Operators (AND across rules; OR within value via "|"):
 '   =    equals (CI, OR via "|")
 '   <>   not equal (single value, CI)
@@ -147,7 +255,7 @@ End Function
 '   Setts_Input Field_LatestComment~?Not sent|SLC|<blank>
 Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
                        filterRules As String, keepCols As String, _
-                       Optional options As String = "")
+                       Optional filterEngine As String = "hybrid")
 
     Dim colDict As Object, rules() As String, rule As Variant
     Dim lastRow As Long, lastCol As Long
@@ -155,10 +263,13 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     Dim fieldName As String, op As String, valueExp As String
     Dim critArr() As String
     Dim colArr() As String, pasteCol As Long, c As Long
-    Dim srcColIdx As Long, colVis As Range, area As Range
+    Dim srcColIdx As Long, colVis As Range, area As Range, cell As Range
     Dim destRow As Long
 
-    ' --- collections for row-level checks ---
+    Dim useArrowOnly As Boolean
+    useArrowOnly = (LCase$(filterEngine) Like "arrow*")
+
+    ' --- collections for HYBRID row-level checks ---
     Dim exBlank As Object                         ' colIdx -> True (exclude trimmed blanks)
     Dim exEqCI As Object, exContCI As Object      ' (case-insensitive) excludes
     Dim exEqCS As Object, exContCS As Object      ' (case-sensitive)   excludes
@@ -167,31 +278,16 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     Dim dictTmp As Object
     Dim v As Variant, p As Variant
 
-    ' --- options (FlagOnly) ---
-    Dim opt As Object
-    Dim flagOnly As Boolean, flagColName As String, flagYes As String, flagNo As String
-
-    Set opt = ParseOptions(options)
-    flagOnly = False: flagColName = "Include?": flagYes = "Yes": flagNo = "No"
-    If Not opt Is Nothing Then
-        If opt.Exists("flagonly") Then flagOnly = CBool(ValueAsBool(opt("flagonly")))
-        If opt.Exists("flagcolumn") Then If Trim$(opt("flagcolumn")) <> "" Then flagColName = Trim$(opt("flagcolumn"))
-        If opt.Exists("flagyes") Then If Trim$(opt("flagyes")) <> "" Then flagYes = Trim$(opt("flagyes"))
-        If opt.Exists("flagn o") Then ' typo-proofing, just in case
-            If Trim$(opt("flagn o")) <> "" Then flagNo = Trim$(opt("flagn o"))
-        ElseIf opt.Exists("flagno") Then
-            If Trim$(opt("flagno")) <> "" Then flagNo = Trim$(opt("flagno"))
-        End If
+    If Not useArrowOnly Then
+        Set exBlank   = CreateObject("Scripting.Dictionary")
+        Set exEqCI    = CreateObject("Scripting.Dictionary")
+        Set exContCI  = CreateObject("Scripting.Dictionary")
+        Set exEqCS    = CreateObject("Scripting.Dictionary")
+        Set exContCS  = CreateObject("Scripting.Dictionary")
+        Set incEqCS   = CreateObject("Scripting.Dictionary")
+        Set incContCS = CreateObject("Scripting.Dictionary")
+        Set incContCI = CreateObject("Scripting.Dictionary")
     End If
-
-    Set exBlank   = CreateObject("Scripting.Dictionary")
-    Set exEqCI    = CreateObject("Scripting.Dictionary")
-    Set exContCI  = CreateObject("Scripting.Dictionary")
-    Set exEqCS    = CreateObject("Scripting.Dictionary")
-    Set exContCS  = CreateObject("Scripting.Dictionary")
-    Set incEqCS   = CreateObject("Scripting.Dictionary")
-    Set incContCS = CreateObject("Scripting.Dictionary")
-    Set incContCI = CreateObject("Scripting.Dictionary")
 
     Set colDict = CreateObject("Scripting.Dictionary")
 
@@ -209,25 +305,24 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     Next c
 
     ' Prep
-    If Not flagOnly Then wsTarget.Cells.Clear
+    wsTarget.Cells.Clear
     If wsSource.AutoFilterMode Then wsSource.AutoFilterMode = False
     rngData.AutoFilter
 
-    ' Parse & apply rules
-    If Len(Trim(filterRules)) > 0 Then
+    ' ----- Parse & apply rules -----
+    If Len(Trim$(filterRules)) > 0 Then
         rules = Split(filterRules, ";")
         For Each rule In rules
             rule = Trim(CStr(rule))
             If Len(rule) = 0 Then GoTo NextRule
 
-            ' detect operator (check longer tokens first)
             op = ""
             Select Case True
                 Case InStr(rule, "!=^") > 0: op = "!=^"
                 Case InStr(rule, "!~^") > 0: op = "!~^"
                 Case InStr(rule, "=^")  > 0: op = "=^"
                 Case InStr(rule, "~^")  > 0: op = "~^"
-                Case InStr(rule, "~?")  > 0: op = "~?"
+                Case InStr(rule, "~?")  > 0: op = "~?"   ' CI include (unlimited OR)
                 Case InStr(rule, "!=")  > 0: op = "!="
                 Case InStr(rule, "!~")  > 0: op = "!~"
                 Case InStr(rule, "<>")  > 0: op = "<>"
@@ -246,119 +341,169 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
 
             Dim fld As Long: fld = colDict(LCase(fieldName))
 
-            Select Case op
-                ' ---------- CASE-SENSITIVE includes ----------
-                Case "=^"
-                    If Not incEqCS.Exists(fld) Then Set incEqCS(fld) = CreateObject("Scripting.Dictionary")
-                    Set dictTmp = incEqCS(fld)
-                    If InStr(valueExp, "|") > 0 Then
-                        For Each v In Split(valueExp, "|"): dictTmp(Trim(CStr(v))) = True: Next v
-                    Else
-                        dictTmp(Trim$(valueExp)) = True
-                    End If
-
-                Case "~^"
-                    If Not incContCS.Exists(fld) Then Set incContCS(fld) = CreateObject("Scripting.Dictionary")
-                    Set dictTmp = incContCS(fld)
-                    If InStr(valueExp, "|") > 0 Then
-                        For Each p In Split(valueExp, "|"): dictTmp(Trim(CStr(p))) = True: Next p
-                    Else
-                        dictTmp(Trim$(valueExp)) = True
-                    End If
-
-                ' ---------- CASE-INSENSITIVE includes (NEW) ----------
-                Case "~?"
-                    If Not incContCI.Exists(fld) Then Set incContCI(fld) = CreateObject("Scripting.Dictionary")
-                    Set dictTmp = incContCI(fld)
-                    If InStr(valueExp, "|") > 0 Then
-                        For Each p In Split(valueExp, "|")
-                            p = Trim(CStr(p))
-                            If LCase$(p) = "<blank>" Then
-                                dictTmp("__BLANK__") = True
-                            Else
-                                dictTmp(LCase$(p)) = True
-                            End If
-                        Next p
-                    Else
-                        If LCase$(valueExp) = "<blank>" Then
-                            dictTmp("__BLANK__") = True
+            If useArrowOnly Then
+                ' -------------------- ARROW MODE (AutoFilter-only) --------------------
+                Select Case op
+                    Case "="
+                        If InStr(valueExp, "|") > 0 Then
+                            critArr = Split(valueExp, "|")
+                            rngData.AutoFilter Field:=fld, Criteria1:=critArr, Operator:=xlFilterValues
                         Else
-                            dictTmp(LCase$(valueExp)) = True
+                            rngData.AutoFilter Field:=fld, Criteria1:=valueExp
                         End If
-                    End If
 
-                ' ---------- CASE-SENSITIVE excludes ----------
-                Case "!=^"
-                    If valueExp = "" Then
-                        exBlank(fld) = True
-                    Else
-                        If Not exEqCS.Exists(fld) Then Set exEqCS(fld) = CreateObject("Scripting.Dictionary")
-                        Set dictTmp = exEqCS(fld)
+                    Case "<>", ">", "<", ">=", "<="
+                        rngData.AutoFilter Field:=fld, Criteria1:=op & valueExp
+
+                    Case "!="
+                        If valueExp = "" Then
+                            ' Non-blanks (note: Arrow mode does not trim spaces)
+                            rngData.AutoFilter Field:=fld, Criteria1:="<>"
+                        Else
+                            critArr = Split(valueExp, "|")
+                            If UBound(critArr) = 0 Then
+                                rngData.AutoFilter Field:=fld, Criteria1:="<>" & Trim(critArr(0))
+                            Else
+                                ' up to two NOT-EQUAL via AND; extras ignored
+                                rngData.AutoFilter Field:=fld, _
+                                    Criteria1:="<>" & Trim(critArr(0)), _
+                                    Operator:=xlAnd, _
+                                    Criteria2:="<>" & Trim(critArr(1))
+                            End If
+                        End If
+
+                    Case "~"
+                        critArr = Split(valueExp, "|")
+                        If UBound(critArr) = 0 Then
+                            rngData.AutoFilter Field:=fld, Criteria1:="*" & Trim(critArr(0)) & "*"
+                        Else
+                            ' up to two contains via OR; extras ignored
+                            rngData.AutoFilter Field:=fld, _
+                                Criteria1:="*" & Trim(critArr(0)) & "*", _
+                                Operator:=xlOr, _
+                                Criteria2:="*" & Trim(critArr(1)) & "*"
+                        End If
+
+                    Case Else
+                        ' NOT supported in Arrow mode: !~, =^, ~^, !=^, ~?
+                        ' silently ignored
+                End Select
+
+            Else
+                ' -------------------- HYBRID MODE (powerful logic) --------------------
+                Select Case op
+                    ' CASE-SENSITIVE includes
+                    Case "=^"
+                        If Not incEqCS.Exists(fld) Then Set incEqCS(fld) = CreateObject("Scripting.Dictionary")
+                        Set dictTmp = incEqCS(fld)
                         If InStr(valueExp, "|") > 0 Then
                             For Each v In Split(valueExp, "|"): dictTmp(Trim(CStr(v))) = True: Next v
                         Else
                             dictTmp(Trim$(valueExp)) = True
                         End If
-                    End If
 
-                Case "!~^"
-                    If Not exContCS.Exists(fld) Then Set exContCS(fld) = CreateObject("Scripting.Dictionary")
-                    Set dictTmp = exContCS(fld)
-                    If InStr(valueExp, "|") > 0 Then
-                        For Each p In Split(valueExp, "|"): dictTmp(Trim(CStr(p))) = True: Next p
-                    Else
-                        dictTmp(Trim$(valueExp)) = True
-                    End If
+                    Case "~^"
+                        If Not incContCS.Exists(fld) Then Set incContCS(fld) = CreateObject("Scripting.Dictionary")
+                        Set dictTmp = incContCS(fld)
+                        If InStr(valueExp, "|") > 0 Then
+                            For Each v In Split(valueExp, "|"): dictTmp(Trim(CStr(v))) = True: Next v
+                        Else
+                            dictTmp(Trim$(valueExp)) = True
+                        End If
 
-                ' ---------- CASE-INSENSITIVE excludes ----------
-                Case "!="
-                    If valueExp = "" Then
-                        exBlank(fld) = True
-                    ElseIf InStr(valueExp, "|") > 0 Then
-                        If Not exEqCI.Exists(fld) Then Set exEqCI(fld) = CreateObject("Scripting.Dictionary")
-                        Set dictTmp = exEqCI(fld)
-                        For Each v In Split(valueExp, "|")
-                            dictTmp(LCase(Trim(CStr(v)))) = True
-                        Next v
-                    Else
-                        rngData.AutoFilter Field:=fld, Criteria1:="<>" & valueExp
-                    End If
+                    ' CI includes (unlimited OR, supports <blank>)
+                    Case "~?"
+                        If Not incContCI.Exists(fld) Then Set incContCI(fld) = CreateObject("Scripting.Dictionary")
+                        Set dictTmp = incContCI(fld)
+                        If InStr(valueExp, "|") > 0 Then
+                            For Each v In Split(valueExp, "|")
+                                v = Trim(CStr(v))
+                                If LCase$(v) = "<blank>" Then
+                                    dictTmp("__BLANK__") = True
+                                Else
+                                    dictTmp(LCase$(v)) = True
+                                End If
+                            Next v
+                        Else
+                            If LCase$(valueExp) = "<blank>" Then
+                                dictTmp("__BLANK__") = True
+                            Else
+                                dictTmp(LCase$(valueExp)) = True
+                            End If
+                        End If
 
-                Case "!~"
-                    If Not exContCI.Exists(fld) Then Set exContCI(fld) = CreateObject("Scripting.Dictionary")
-                    Set dictTmp = exContCI(fld)
-                    If InStr(valueExp, "|") > 0 Then
-                        For Each p In Split(valueExp, "|")
-                            dictTmp(LCase(Trim(CStr(p)))) = True
-                        Next p
-                    Else
-                        dictTmp(LCase(Trim$(valueExp))) = True
-                    End If
+                    ' CASE-SENSITIVE excludes
+                    Case "!=^"
+                        If valueExp = "" Then
+                            exBlank(fld) = True
+                        Else
+                            If Not exEqCS.Exists(fld) Then Set exEqCS(fld) = CreateObject("Scripting.Dictionary")
+                            Set dictTmp = exEqCS(fld)
+                            If InStr(valueExp, "|") > 0 Then
+                                For Each v In Split(valueExp, "|"): dictTmp(Trim(CStr(v))) = True: Next v
+                            Else
+                                dictTmp(Trim$(valueExp)) = True
+                            End If
+                        End If
 
-                ' ---------- POSITIVE CI rules (AutoFilter) ----------
-                Case "="
-                    If InStr(valueExp, "|") > 0 Then
+                    Case "!~^"
+                        If Not exContCS.Exists(fld) Then Set exContCS(fld) = CreateObject("Scripting.Dictionary")
+                        Set dictTmp = exContCS(fld)
+                        If InStr(valueExp, "|") > 0 Then
+                            For Each v In Split(valueExp, "|"): dictTmp(Trim(CStr(v))) = True: Next v
+                        Else
+                            dictTmp(Trim$(valueExp)) = True
+                        End If
+
+                    ' CASE-INSENSITIVE excludes
+                    Case "!="
+                        If valueExp = "" Then
+                            exBlank(fld) = True
+                        ElseIf InStr(valueExp, "|") > 0 Then
+                            If Not exEqCI.Exists(fld) Then Set exEqCI(fld) = CreateObject("Scripting.Dictionary")
+                            Set dictTmp = exEqCI(fld)
+                            For Each v In Split(valueExp, "|")
+                                dictTmp(LCase(Trim(CStr(v)))) = True
+                            Next v
+                        Else
+                            rngData.AutoFilter Field:=fld, Criteria1:="<>" & valueExp
+                        End If
+
+                    Case "!~"
+                        If Not exContCI.Exists(fld) Then Set exContCI(fld) = CreateObject("Scripting.Dictionary")
+                        Set dictTmp = exContCI(fld)
+                        If InStr(valueExp, "|") > 0 Then
+                            For Each v In Split(valueExp, "|")
+                                dictTmp(LCase(Trim(CStr(v)))) = True
+                            Next v
+                        Else
+                            dictTmp(LCase(Trim$(valueExp))) = True
+                        End If
+
+                    ' POSITIVE CI (AutoFilter)
+                    Case "="
+                        If InStr(valueExp, "|") > 0 Then
+                            critArr = Split(valueExp, "|")
+                            rngData.AutoFilter Field:=fld, Criteria1:=critArr, Operator:=xlFilterValues
+                        Else
+                            rngData.AutoFilter Field:=fld, Criteria1:=valueExp
+                        End If
+
+                    Case "<>", ">", "<", ">=", "<="
+                        rngData.AutoFilter Field:=fld, Criteria1:=op & valueExp
+
+                    Case "~"
                         critArr = Split(valueExp, "|")
-                        rngData.AutoFilter Field:=fld, Criteria1:=critArr, Operator:=xlFilterValues
-                    Else
-                        rngData.AutoFilter Field:=fld, Criteria1:=valueExp
-                    End If
-
-                Case "<>", ">", "<", ">=", "<="
-                    rngData.AutoFilter Field:=fld, Criteria1:=op & valueExp
-
-                Case "~"
-                    critArr = Split(valueExp, "|")
-                    If UBound(critArr) = 0 Then
-                        rngData.AutoFilter Field:=fld, Criteria1:="*" & Trim(critArr(0)) & "*"
-                    Else
-                        ' supports two contains terms via OR; for >2, prefer ~?
-                        rngData.AutoFilter Field:=fld, _
-                                          Criteria1:="*" & Trim(critArr(0)) & "*", _
-                                          Operator:=xlOr, _
-                                          Criteria2:="*" & Trim(critArr(1)) & "*"
-                    End If
-            End Select
+                        If UBound(critArr) = 0 Then
+                            rngData.AutoFilter Field:=fld, Criteria1:="*" & Trim(critArr(0)) & "*"
+                        Else
+                            rngData.AutoFilter Field:=fld, _
+                                Criteria1:="*" & Trim(critArr(0)) & "*", _
+                                Operator:=xlOr, _
+                                Criteria2:="*" & Trim(critArr(1)) & "*"
+                        End If
+                End Select
+            End If
 
 NextRule:
         Next rule
@@ -373,49 +518,7 @@ NextRule:
         Exit Sub
     End If
 
-    ' ---------- FLAG ONLY MODE ----------
-    If flagOnly Then
-        Dim visibleRow As Object, ar As Range, rr As Range, r As Long
-        Set visibleRow = CreateObject("Scripting.Dictionary")
-
-        ' collect visible rows after AutoFilter
-        For Each ar In vis.Areas
-            For Each rr In ar.Rows
-                visibleRow(rr.Row) = True
-            Next rr
-        Next ar
-
-        ' ensure/create flag column on SOURCE
-        Dim flagColIdx As Long, srcLastCol As Long
-        srcLastCol = wsSource.Cells(1, wsSource.Columns.Count).End(xlToLeft).Column
-        flagColIdx = FindCol(wsSource, flagColName)
-        If flagColIdx = 0 Then
-            flagColIdx = srcLastCol + 1
-            wsSource.Cells(1, flagColIdx).Value = flagColName
-        Else
-            ' clear old flags
-            wsSource.Range(wsSource.Cells(2, flagColIdx), wsSource.Cells(lastRow, flagColIdx)).ClearContents
-        End If
-
-        ' mark Yes/No
-        For r = 2 To lastRow
-            If visibleRow.Exists(r) And RowPassesRules(wsSource, r, _
-                                                       exBlank, exEqCI, exContCI, _
-                                                       exEqCS, exContCS, _
-                                                       incEqCS, incContCS, _
-                                                       incContCI) Then
-                wsSource.Cells(r, flagColIdx).Value = flagYes
-            Else
-                wsSource.Cells(r, flagColIdx).Value = flagNo
-            End If
-        Next r
-
-        wsSource.AutoFilterMode = False
-        Exit Sub
-    End If
-    ' ---------- END FLAG ONLY MODE ----------
-
-    ' Copy requested columns, enforcing row-level includes/excludes
+    ' Copy requested columns, appending all visible Areas
     colArr = Split(keepCols, ",")
     pasteCol = 1
 
@@ -424,6 +527,7 @@ NextRule:
         If colDict.Exists(LCase(Trim(colArr(c)))) Then
             srcColIdx = colDict(LCase(Trim(colArr(c))))
         Else
+            ' Uncomment for diagnostics:
             ' Debug.Print "Skip missing keep column in source: [" & Trim(colArr(c)) & "] on sheet " & wsSource.Name
         End If
         If srcColIdx = 0 Then GoTo NextKeep
@@ -433,16 +537,22 @@ NextRule:
 
         Set colVis = Application.Intersect(vis, wsSource.Columns(srcColIdx))
         If Not colVis Is Nothing Then
-            Dim cell As Range
             For Each area In colVis.Areas
                 For Each cell In area.Cells
-                    If RowPassesRules(wsSource, cell.Row, _
-                                      exBlank, exEqCI, exContCI, _
-                                      exEqCS, exContCS, _
-                                      incEqCS, incContCS, _
-                                      incContCI) Then
+                    If useArrowOnly Then
+                        ' Arrow mode: accept visible rows as-is
                         wsTarget.Cells(destRow, pasteCol).Value = cell.Value
                         destRow = destRow + 1
+                    Else
+                        ' Hybrid mode: enforce row-level rules
+                        If RowPassesRules(wsSource, cell.Row, _
+                                          exBlank, exEqCI, exContCI, _
+                                          exEqCS, exContCS, _
+                                          incEqCS, incContCS, _
+                                          incContCI) Then
+                            wsTarget.Cells(destRow, pasteCol).Value = cell.Value
+                            destRow = destRow + 1
+                        End If
                     End If
                 Next cell
             Next area
@@ -455,7 +565,7 @@ NextKeep:
     wsSource.AutoFilterMode = False
 End Sub
 
-' ========= RENAME HEADERS (safe: ignore missing originals; avoid collisions; supports multi-origin "A|B:New") =========
+' ========= RENAME HEADERS (safe; supports multi-origin "A|B:New") =========
 Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
     Dim mapArr() As String, pair As Variant
     Dim leftPart As String, newName As String
@@ -496,7 +606,7 @@ Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
 
             If Not IsEmpty(foundIdx) Then
                 colIdx = CLng(foundIdx)
-                ' Avoid collision: if new header already exists on different col, skip
+                ' Avoid collision: if new header already exists on a different column, skip
                 If hdrDict.Exists(LCase$(newName)) And hdrDict(LCase$(newName)) <> colIdx Then
                     ' skip silently
                 Else
@@ -520,13 +630,25 @@ NextPair:
     Next pair
 End Sub
 
-' ========= OPTIONS: headers, autofit, freeze, number formats by header, comma styles =========
+' ========= OPTIONS: headers, autofit, freeze, number formats, comma style =========
 Sub ApplyOptions(ws As Worksheet, options As String)
-    Dim opt As Object, pairs() As String, p As Variant, colFmt() As String
-    Dim colIdx As Long, lastRow As Long
+    Dim optArr() As String, kv() As String, i As Long
+    Dim opt As Object: Set opt = CreateObject("Scripting.Dictionary")
+    If Trim$(options) = "" Then Exit Sub
 
-    Set opt = ParseOptions(options)
-    If opt Is Nothing Then Exit Sub
+    ' Parse: "Key=Value;Flag;Key2=Value2"
+    optArr = Split(options, ";")
+    For i = LBound(optArr) To UBound(optArr)
+        optArr(i) = Trim$(optArr(i))
+        If optArr(i) <> "" Then
+            If InStr(optArr(i), "=") > 0 Then
+                kv = Split(optArr(i), "=", 2)
+                opt(LCase$(Trim$(kv(0)))) = Trim$(kv(1))
+            Else
+                opt(LCase$(optArr(i))) = True
+            End If
+        End If
+    Next i
 
     If opt.Exists("headersbold") Then
         ws.Rows(1).Font.Bold = True
@@ -539,10 +661,13 @@ Sub ApplyOptions(ws As Worksheet, options As String)
     End If
 
     ' Number formats by header (after renaming)
-    ' Syntax: NumFmt=Amount:#,##0.00|UsdEquivalent:#,##0.00|RWA Exposure:0.00%|PaymentDate:yyyy-mm-dd
+    ' Example: NumFmt=Break USD:#,##0.00|RWA Exposure:0.00%|PaymentDate:yyyy-mm-dd
     If opt.Exists("numfmt") Then
-        pairs = Split(CStr(opt("numfmt")), "|")
+        Dim pairs() As String, p As Variant, colFmt() As String
+        Dim colIdx As Long, lastRow As Long
+        pairs = Split(opt("numfmt"), "|")
         lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+
         For Each p In pairs
             If InStr(p, ":") > 0 Then
                 colFmt = Split(p, ":", 2)
@@ -554,7 +679,9 @@ Sub ApplyOptions(ws As Worksheet, options As String)
         Next p
     End If
 
-    ' Comma styles
+    ' Comma styles by header (after renaming)
+    ' Two decimals:   CommaStyle=HeaderA|HeaderB
+    ' Zero decimals:  CommaStyle0=HeaderC|HeaderD
     If opt.Exists("commastyle") Then
         ApplyCommaStyleToHeaders ws, CStr(opt("commastyle")), False
     End If
@@ -563,65 +690,36 @@ Sub ApplyOptions(ws As Worksheet, options As String)
     End If
 End Sub
 
-' ========= OPTIONAL: RUN SUBSETS (Risk-only / Balance-only) =========
-Sub RunRiskPipeline():    RunConfigSubset "Risk Report":            End Sub
-Sub RunBalancePipeline(): RunConfigSubset "Balance Break Report":  End Sub
+Private Sub ApplyCommaStyleToHeaders(ws As Worksheet, headersList As String, zeroDecimals As Boolean)
+    Dim arr() As String, h As Variant
+    Dim colIdx As Long, lastRow As Long
+    Dim rng As Range, styleName As String
 
-Sub RunConfigSubset(startSheet As String)
-    Dim wsConfig As Worksheet, order As Collection
-    Dim allowed As Object, i As Long, cfgRow As Long
-    Dim sheetName As String, sourceName As String, parentName As String
-    Dim filterRules As String, keepCols As String, renameMap As String, options As String
-    Dim wsInput As Worksheet, wsTarget As Worksheet
-    Dim opt As Object, isFlagOnly As Boolean
+    If Trim$(headersList) = "" Then Exit Sub
+    arr = Split(headersList, "|")
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
 
-    Set wsConfig = ThisWorkbook.Sheets("Config")
-    Set order = GetExecutionOrder(wsConfig)
-    If order Is Nothing Then Exit Sub
-
-    Set allowed = CreateObject("Scripting.Dictionary")
-    CollectDependents wsConfig, startSheet, allowed
-
-    For i = 1 To order.Count
-        sheetName = CStr(order(i))
-        If Not allowed.Exists(sheetName) Then GoTo NextItem
-
-        cfgRow = FindConfigRow(wsConfig, sheetName)
-        If cfgRow = 0 Then GoTo NextItem
-
-        sourceName = Trim(CStr(wsConfig.Cells(cfgRow, 2).Value))
-        parentName = Trim(CStr(wsConfig.Cells(cfgRow, 3).Value))
-        filterRules = CStr(wsConfig.Cells(cfgRow, 4).Value)
-        keepCols    = CStr(wsConfig.Cells(cfgRow, 5).Value)
-        renameMap   = CStr(wsConfig.Cells(cfgRow, 6).Value)
-        options     = CStr(wsConfig.Cells(cfgRow, 7).Value)
-
-        Set wsInput = Nothing
-        If sourceName <> "" And SheetExists(sourceName) Then
-            Set wsInput = ThisWorkbook.Sheets(sourceName)
-        ElseIf parentName <> "" And SheetExists(parentName) Then
-            Set wsInput = ThisWorkbook.Sheets(parentName)
+    For Each h In arr
+        colIdx = FindCol(ws, Trim$(CStr(h))) ' uses final (post-rename) headers
+        If colIdx > 0 Then
+            Set rng = ws.Range(ws.Cells(2, colIdx), ws.Cells(Application.Max(2, lastRow), colIdx))
+            styleName = IIf(zeroDecimals, "Comma [0]", "Comma")
+            On Error Resume Next
+            rng.Style = styleName                     ' try built-in style
+            If Err.Number <> 0 Then                  ' fallback (localized Excel)
+                Err.Clear
+                If zeroDecimals Then
+                    rng.NumberFormat = "#,##0"
+                Else
+                    rng.NumberFormat = "#,##0.00"
+                End If
+            End If
+            On Error GoTo 0
         End If
-        If wsInput Is Nothing Then GoTo NextItem
-
-        Set wsTarget = GetOrCreateSheet(sheetName)
-
-        ' parse FlagOnly
-        Set opt = ParseOptions(options)
-        isFlagOnly = False
-        If Not opt Is Nothing Then
-            If opt.Exists("flagonly") Then isFlagOnly = CBool(ValueAsBool(opt("flagonly")))
-        End If
-
-        FilterAndCopy_Flex wsInput, wsTarget, filterRules, keepCols, options
-        If Not isFlagOnly Then
-            ApplyRenameMap     wsTarget, renameMap
-            ApplyOptions       wsTarget, options
-        End If
-NextItem:
-    Next i
+    Next h
 End Sub
 
+' ========= HELPERS =========
 Sub CollectDependents(wsConfig As Worksheet, root As String, allowed As Object)
     Dim lastRow As Long, i As Long, sName As String, pName As String
     If allowed.Exists(root) Then Exit Sub
@@ -635,7 +733,6 @@ Sub CollectDependents(wsConfig As Worksheet, root As String, allowed As Object)
     Next i
 End Sub
 
-' ========= HELPERS =========
 Function SheetExists(ByVal sheetName As String) As Boolean
     Dim ws As Worksheet
     On Error Resume Next
@@ -782,63 +879,3 @@ Private Function RowPassesRules(ws As Worksheet, r As Long, _
 
     RowPassesRules = True
 End Function
-
-' --- Options parsing + helpers ---
-Private Function ParseOptions(options As String) As Object
-    Dim d As Object, arr() As String, i As Long, kv() As String, tok As String
-    If Trim$(options) = "" Then Exit Function
-    Set d = CreateObject("Scripting.Dictionary")
-    arr = Split(options, ";")
-    For i = LBound(arr) To UBound(arr)
-        tok = Trim$(arr(i))
-        If tok <> "" Then
-            If InStr(tok, "=") > 0 Then
-                kv = Split(tok, "=", 2)
-                d(LCase$(Trim$(kv(0)))) = Trim$(kv(1))
-            Else
-                d(LCase$(tok)) = True
-            End If
-        End If
-    Next i
-    Set ParseOptions = d
-End Function
-
-Private Function ValueAsBool(v As Variant) As Boolean
-    Dim s As String
-    If VarType(v) = vbBoolean Then
-        ValueAsBool = v
-    Else
-        s = LCase$(Trim$(CStr(v)))
-        ValueAsBool = (s = "true" Or s = "yes" Or s = "1" Or s = "y")
-    End If
-End Function
-
-' --- Comma style helper ---
-Private Sub ApplyCommaStyleToHeaders(ws As Worksheet, headersList As String, zeroDecimals As Boolean)
-    Dim arr() As String, h As Variant
-    Dim colIdx As Long, lastRow As Long
-    Dim rng As Range, styleName As String
-
-    If Trim$(headersList) = "" Then Exit Sub
-    arr = Split(headersList, "|")
-    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
-
-    For Each h In arr
-        colIdx = FindCol(ws, Trim$(CStr(h))) ' uses final (post-rename) headers
-        If colIdx > 0 Then
-            Set rng = ws.Range(ws.Cells(2, colIdx), ws.Cells(Application.Max(2, lastRow), colIdx))
-            styleName = IIf(zeroDecimals, "Comma [0]", "Comma")
-            On Error Resume Next
-            rng.Style = styleName                     ' try built-in style
-            If Err.Number <> 0 Then                  ' fallback (localized Excel)
-                Err.Clear
-                If zeroDecimals Then
-                    rng.NumberFormat = "#,##0"
-                Else
-                    rng.NumberFormat = "#,##0.00"
-                End If
-            End If
-            On Error GoTo 0
-        End If
-    Next h
-End Sub
