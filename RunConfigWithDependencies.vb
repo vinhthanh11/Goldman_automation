@@ -5,10 +5,10 @@ Option Explicit
 ' A: SheetName
 ' B: Source          (raw sheet name, or blank if dependent)
 ' C: ParentReport    (upstream sheet name, or blank if base)
-' D: FilterRules     (operators guide below)
+' D: FilterRules     (operators guide inside FilterAndCopy_Flex)
 ' E: KeepColumns     (CSV; use INPUT headers seen on the source/parent)
-' F: RenameMap       (CSV of "Original:New" or "Orig1|Orig2:New"; missing originals ignored)
-' G: Options         (e.g., "HeadersBold=True;AutoFit=True;CommaStyle=Amt|USD;NumFmt=PaymentDate:yyyy-mm-dd")
+' F: RenameMap       (CSV "Orig:New" or "OrigA|OrigB:New"; missing originals ignored)
+' G: Options         (e.g. "PreFill=Name:=Advisor|Client||Country:=Facet Country Name;PreFillScope=Source;HeadersBold=True;AutoFit=True;CommaStyle=USD")
 ' =========================
 
 ' ========= MAIN (runs everything per Config) =========
@@ -19,6 +19,7 @@ Sub RunConfigWithDependencies()
     Dim filterRules As String, keepCols As String, renameMap As String, options As String
     Dim wsInput As Worksheet, wsTarget As Worksheet
     Dim scrn As Boolean, calc As XlCalculation
+    Dim prefillSpec As String, prefillScope As String, doPrefill As Boolean
 
     scrn = Application.ScreenUpdating: Application.ScreenUpdating = False
     calc = Application.Calculation:    Application.Calculation = xlCalculationManual
@@ -39,6 +40,7 @@ Sub RunConfigWithDependencies()
         renameMap   = CStr(wsConfig.Cells(cfgRow, 6).Value)
         options     = CStr(wsConfig.Cells(cfgRow, 7).Value)
 
+        ' Decide input sheet
         Set wsInput = Nothing
         If sourceName <> "" Then
             If SheetExists(sourceName) Then Set wsInput = ThisWorkbook.Sheets(sourceName)
@@ -47,8 +49,23 @@ Sub RunConfigWithDependencies()
         End If
         If wsInput Is Nothing Then GoTo NextItem
 
+        ' Prefill (optional; in-place on input)
+        prefillSpec = GetOptionValue(options, "PreFill")
+        prefillScope = LCase$(GetOptionValue(options, "PreFillScope")) ' "", "source", "parent", "both"
+        doPrefill = False
+        If prefillSpec <> "" Then
+            If sourceName <> "" Then
+                If prefillScope = "" Or prefillScope = "source" Or prefillScope = "both" Then doPrefill = True
+            Else
+                If prefillScope = "parent" Or prefillScope = "both" Then doPrefill = True
+            End If
+        End If
+        If doPrefill Then ApplyPreFill wsInput, prefillSpec
+
+        ' Ensure target exists
         Set wsTarget = GetOrCreateSheet(sheetName)
 
+        ' Process
         FilterAndCopy_Flex wsInput, wsTarget, filterRules, keepCols
         ApplyRenameMap     wsTarget, renameMap
         ApplyOptions       wsTarget, options
@@ -117,16 +134,16 @@ End Function
 ' AND across rules (separated by ";"); OR within a single rule's value via "|".
 '
 ' Operators:
-'   =     equals (case-insensitive, OR via "|")
+'   =     equals (CI, OR via "|")
 '   <>    not equal (single value, CI)
 '   !=    not equal (multi OR, CI). "Field!=" excludes blanks/spaces
 '   ~     contains (CI; up to two patterns via "|")
 '   !~    does NOT contain (CI; any # of patterns)
 '   > < >= <=   numeric/date comparisons
-'   =^    equals (case-sensitive, OR via "|")
-'   ~^    contains (case-sensitive, any #)
-'   !=^   not equal (case-sensitive, OR). "Field!=^" excludes blanks/spaces
-'   !~^   does NOT contain (case-sensitive, any #)
+'   =^    equals (CS, OR via "|")
+'   ~^    contains (CS, any #)
+'   !=^   not equal (CS, OR). "Field!=^" excludes blanks/spaces
+'   !~^   does NOT contain (CS, any #)
 '   ~?    contains (CI include, unlimited OR, supports <blank>)  ← handy for OR lists + blanks
 '
 ' Example:
@@ -164,8 +181,8 @@ Sub FilterAndCopy_Flex(wsSource As Worksheet, wsTarget As Worksheet, _
     Set colDict = CreateObject("Scripting.Dictionary")
 
     ' Data range
-    lastRow = wsSource.Cells(wsSource.Rows.Count, 1).End(xlUp).Row
-    lastCol = wsSource.Cells(1, wsSource.Columns.Count).End(xlToLeft).Column
+    lastRow = GetLastUsedRow(wsSource)
+    lastCol = GetLastUsedCol(wsSource)
     If lastRow < 2 Or lastCol < 1 Then Exit Sub
 
     Set rngData = wsSource.Cells(1, 1).Resize(lastRow, lastCol)
@@ -378,8 +395,68 @@ NextKeep:
     wsSource.AutoFilterMode = False
 End Sub
 
+' ========= PREFILL (new): fill blanks in target using one or more fallback sources =========
+' Options example:
+'   PreFill=Name:=Setts_Input Field_Investment Advisor|Facet Client Name||Country:=Facet Country Name
+'   PreFillScope=Source   ' default (or Parent / Both)
+Sub ApplyPreFill(ws As Worksheet, prefillSpec As String)
+    Dim rules() As String, rule As Variant
+    Dim target As String, sourcesJoined As String, sources() As String
+    Dim sepPos As Long, i As Long
+    Dim lastRow As Long, tCol As Long, sCol As Long
+    Dim tArr As Variant, sArr As Variant
+    Dim r As Long, s As Long
+
+    prefillSpec = Trim$(prefillSpec)
+    If prefillSpec = "" Then Exit Sub
+
+    lastRow = GetLastUsedRow(ws)
+    If lastRow < 2 Then Exit Sub
+
+    rules = Split(prefillSpec, "||") ' separate independent rules
+    For Each rule In rules
+        rule = Trim$(CStr(rule))
+        If rule = "" Then GoTo NextRule
+
+        sepPos = InStr(1, rule, ":=")
+        If sepPos = 0 Then GoTo NextRule
+
+        target = Trim$(Left$(rule, sepPos - 1))
+        sourcesJoined = Trim$(Mid$(rule, sepPos + 2))
+        If target = "" Or sourcesJoined = "" Then GoTo NextRule
+
+        sources = Split(sourcesJoined, "|")
+
+        tCol = FindCol(ws, target)
+        If tCol = 0 Then GoTo NextRule
+
+        ' read target column (rows 2..lastRow) to array
+        tArr = ws.Range(ws.Cells(2, tCol), ws.Cells(lastRow, tCol)).Value
+
+        ' For each source candidate in order
+        For s = LBound(sources) To UBound(sources)
+            sCol = FindCol(ws, Trim$(CStr(sources(s))))
+            If sCol > 0 Then
+                sArr = ws.Range(ws.Cells(2, sCol), ws.Cells(lastRow, sCol)).Value
+                ' fill blanks in target from this source
+                For r = 1 To UBound(tArr, 1)
+                    If VTrim(tArr(r, 1)) = "" Then
+                        If VTrim(sArr(r, 1)) <> "" Then
+                            tArr(r, 1) = sArr(r, 1)
+                        End If
+                    End If
+                Next r
+            End If
+        Next s
+
+        ' write back filled target
+        ws.Range(ws.Cells(2, tCol), ws.Cells(lastRow, tCol)).Value = tArr
+
+NextRule:
+    Next rule
+End Sub
+
 ' ========= RENAME HEADERS (multi-origin, safe) =========
-' Supports "OrigA|OrigB:NewName" and skips missing originals; avoids header collisions.
 Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
     Dim mapArr() As String, pair As Variant
     Dim leftPart As String, newName As String
@@ -390,7 +467,8 @@ Sub ApplyRenameMap(ws As Worksheet, renameMap As String)
     If Trim$(renameMap) = "" Then Exit Sub
 
     Set hdrDict = CreateObject("Scripting.Dictionary")
-    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    lastCol = GetLastUsedCol(ws)
+    If lastCol < 1 Then Exit Sub
     For i = 1 To lastCol
         hdrDict(LCase$(Trim$(ws.Cells(1, i).Value))) = i
     Next i
@@ -474,8 +552,7 @@ Sub ApplyOptions(ws As Worksheet, options As String)
         Dim pairs() As String, p As Variant, colFmt() As String
         Dim colIdx As Long, lastRow As Long
         pairs = Split(opt("numfmt"), "|")
-        lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
-
+        lastRow = GetLastUsedRow(ws)
         For Each p In pairs
             If InStr(p, ":") > 0 Then
                 colFmt = Split(p, ":", 2)
@@ -503,7 +580,7 @@ Private Sub ApplyCommaStyleToHeaders(ws As Worksheet, headersList As String, zer
 
     If Trim$(headersList) = "" Then Exit Sub
     arr = Split(headersList, "|")
-    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    lastRow = GetLastUsedRow(ws)
 
     For Each h In arr
         colIdx = FindCol(ws, Trim$(CStr(h)))
@@ -535,6 +612,7 @@ Sub RunConfigSubset(startSheet As String)
     Dim sheetName As String, sourceName As String, parentName As String
     Dim filterRules As String, keepCols As String, renameMap As String, options As String
     Dim wsInput As Worksheet, wsTarget As Worksheet
+    Dim prefillSpec As String, prefillScope As String, doPrefill As Boolean
 
     Set wsConfig = ThisWorkbook.Sheets("Config")
     Set order = GetExecutionOrder(wsConfig)
@@ -564,6 +642,19 @@ Sub RunConfigSubset(startSheet As String)
             Set wsInput = ThisWorkbook.Sheets(parentName)
         End If
         If wsInput Is Nothing Then GoTo NextItem
+
+        ' Prefill per scope
+        prefillSpec = GetOptionValue(options, "PreFill")
+        prefillScope = LCase$(GetOptionValue(options, "PreFillScope"))
+        doPrefill = False
+        If prefillSpec <> "" Then
+            If sourceName <> "" Then
+                If prefillScope = "" Or prefillScope = "source" Or prefillScope = "both" Then doPrefill = True
+            Else
+                If prefillScope = "parent" Or prefillScope = "both" Then doPrefill = True
+            End If
+        End If
+        If doPrefill Then ApplyPreFill wsInput, prefillSpec
 
         Set wsTarget = GetOrCreateSheet(sheetName)
         FilterAndCopy_Flex wsInput, wsTarget, filterRules, keepCols
@@ -618,7 +709,7 @@ End Function
 
 Function FindCol(ws As Worksheet, header As String) As Long
     Dim lastCol As Long, i As Long
-    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    lastCol = GetLastUsedCol(ws)
     For i = 1 To lastCol
         If LCase(Trim(ws.Cells(1, i).Value)) = LCase(Trim(header)) Then
             FindCol = i
@@ -626,6 +717,59 @@ Function FindCol(ws As Worksheet, header As String) As Long
         End If
     Next i
     FindCol = 0
+End Function
+
+Private Function GetLastUsedRow(ws As Worksheet) As Long
+    Dim c As Range
+    On Error Resume Next
+    Set c = ws.Cells.Find(What:="*", After:=ws.Cells(1, 1), LookIn:=xlFormulas, LookAt:=xlPart, _
+                          SearchOrder:=xlByRows, SearchDirection:=xlPrevious, MatchCase:=False)
+    On Error GoTo 0
+    If Not c Is Nothing Then
+        GetLastUsedRow = c.Row
+    Else
+        GetLastUsedRow = 1
+    End If
+End Function
+
+Private Function GetLastUsedCol(ws As Worksheet) As Long
+    Dim c As Range
+    On Error Resume Next
+    Set c = ws.Cells.Find(What:="*", After:=ws.Cells(1, 1), LookIn:=xlFormulas, LookAt:=xlPart, _
+                          SearchOrder:=xlByColumns, SearchDirection:=xlPrevious, MatchCase:=False)
+    On Error GoTo 0
+    If Not c Is Nothing Then
+        GetLastUsedCol = c.Column
+    Else
+        GetLastUsedCol = 1
+    End If
+End Function
+
+Private Function GetOptionValue(options As String, key As String) As String
+    Dim arr() As String, i As Long, kv() As String, k As String
+    GetOptionValue = ""
+    If Trim$(options) = "" Then Exit Function
+    arr = Split(options, ";")
+    For i = LBound(arr) To UBound(arr)
+        If InStr(arr(i), "=") > 0 Then
+            kv = Split(arr(i), "=", 2)
+            k = LCase$(Trim$(kv(0)))
+            If k = LCase$(key) Then
+                GetOptionValue = Trim$(kv(1))
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+Private Function VTrim(v As Variant) As String
+    If IsError(v) Then
+        VTrim = ""
+    ElseIf IsNull(v) Then
+        VTrim = ""
+    Else
+        VTrim = Trim$(CStr(v))
+    End If
 End Function
 
 Private Function RowPassesRules(ws As Worksheet, r As Long, _
