@@ -853,24 +853,44 @@ Private Function RowPassesRules(ws As Worksheet, r As Long, _
         If Not hit Then RowPassesRules = False: Exit Function
     Next k
 
-    ' Include contains (CI, ~?): must hit at least one per column; <blank> allowed
-    For Each k In incContCI.Keys
-        v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
-        lv = LCase$(v)
-        hit = False
-        If incContCI(k).Exists("__BLANK__") And Trim$(v) = "" Then
-            hit = True
-        Else
-            For Each pat In incContCI(k).Keys
-                If pat <> "__BLANK__" Then
-                    If InStr(1, lv, CStr(pat), vbTextCompare) > 0 Then
-                        hit = True: Exit For
-                    End If
+' Include contains (CI, ~?): must hit at least one per column; <blank> allowed
+For Each k In incContCI.Keys
+    Dim s As String, core As String
+    Dim anchoredStart As Boolean, anchoredEnd As Boolean
+    v = Trim$(CStr(ws.Cells(r, CLng(k)).Value))
+    lv = LCase$(v)
+    hit = False
+
+    ' allow <blank>
+    If incContCI(k).Exists("__BLANK__") And Trim$(v) = "" Then
+        hit = True
+    Else
+        For Each pat In incContCI(k).Keys
+            s = CStr(pat)
+            If s <> "__BLANK__" Then
+                anchoredStart = (Left$(s, 1) = "^")
+                anchoredEnd = (Right$(s, 1) = "$")
+                core = s
+                If anchoredStart Then core = Mid$(core, 2)
+                If anchoredEnd And Len(core) > 0 Then core = Left$(core, Len(core) - 1)
+
+                ' lv and core are already case-insensitive (lv lowercased, core stored lowercased)
+                If anchoredStart And anchoredEnd Then
+                    If lv = core Then hit = True: Exit For
+                ElseIf anchoredStart Then
+                    If Len(core) = 0 Or Left$(lv, Len(core)) = core Then hit = True: Exit For
+                ElseIf anchoredEnd Then
+                    If Len(core) = 0 Or Right$(lv, Len(core)) = core Then hit = True: Exit For
+                Else
+                    If InStr(1, lv, core, vbTextCompare) > 0 Then hit = True: Exit For
                 End If
-            Next pat
-        End If
-        If Not hit Then RowPassesRules = False: Exit Function
-    Next k
+            End If
+        Next pat
+    End If
+
+    If Not hit Then RowPassesRules = False: Exit Function
+Next k
+
 
     RowPassesRules = True
 End Function
