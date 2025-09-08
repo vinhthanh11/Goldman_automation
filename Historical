@@ -1,0 +1,607 @@
+Option Explicit
+' =============================================================================
+' Module: modHistoryAppend
+' Purpose: Post-pass historical appends driven by Config Column H ("History").
+'
+' Works on top of Module 1 (no edits required there).
+' Relies on helper functions already present in Module 1:
+'   - SheetExists, GetOrCreateSheet, GetLastUsedRow, GetLastUsedCol, FindCol, FindConfigRow
+'
+' --------------------------
+' CONFIG SHEET COLUMN MAPPING
+' A: SheetName
+' B: Source
+' C: ParentReport
+' D: FilterRules
+' E: KeepColumns
+' F: RenameMap
+' G: Options
+' H: History  <-- new (this module reads only this column)
+' --------------------------
+'
+' HISTORY SPEC (Column H) - semicolon-delimited key=val, e.g.:
+'   History=On;
+'   HistorySheet=Historical;
+'   HistoryColumns=__TARGET__             (mirror target headers)   OR
+'   HistoryColumns=ID|Client|Amount       (explicit list)
+'   HistoryDateCol=TradeDate              (prefer per-row date from this target column)
+'   HistoryDate=2025-09-08                (constant date for this run if no DateCol)
+'   HistoryDedupKeys=ID|RecordDate        (skip rows already in Historical with same keys)
+'   HistoryOverwrite=RecordDate           (delete prior rows for same SheetName+RecordDate before append)
+'   HistoryWarnMissingCols=True           (optional MsgBox if a requested HistoryColumns is absent)
+'
+' Lineage columns always written to Historical:
+'   [SheetName] [RecordDate] [RunID] [LoadTS] + your business columns (in chosen order)
+' =============================================================================
+
+
+' ========= PUBLIC ENTRYPOINTS =========
+
+' 1) Full wrapper: build all reports (Module 1) then append history (Module 2).
+Public Sub RunConfigWithHistory()
+    Dim runID As String
+    runID = GenerateRunID()
+
+    ' 1) Build/refresh reports using your existing module (no changes needed there).
+    RunConfigWithDependencies
+
+    ' 2) Post-pass: append any reports that turned History=On in Column H.
+    ProcessHistoryForConfig runID
+End Sub
+
+' 2) Subset wrapper (optional): rebuild a subtree then append its history only.
+Public Sub RunConfigSubsetWithHistory(startSheet As String)
+    Dim runID As String
+    runID = GenerateRunID()
+
+    RunConfigSubset startSheet          ' from Module 1
+    ProcessHistoryForConfig runID, startSheet
+End Sub
+
+
+' ========= CORE POST-PASS =========
+
+Private Sub ProcessHistoryForConfig(ByVal runID As String, Optional onlyRoot As String = "")
+    Dim wsConfig As Worksheet
+    Dim lastRow As Long, i As Long
+    Dim sheetName As String, historySpec As String
+    Dim histOpt As Object               ' Dictionary of parsed options
+    Dim allowed As Object, order As Collection
+    Dim idx As Long
+
+    Set wsConfig = ThisWorkbook.Sheets("Config")
+
+    ' If onlyRoot is passed, compute its dependents (reuses Module 1’s method).
+    If Len(onlyRoot) > 0 Then
+        Set allowed = CreateObject("Scripting.Dictionary")
+        CollectDependents wsConfig, onlyRoot, allowed         ' from Module 1
+        Set order = GetExecutionOrder(wsConfig)               ' from Module 1
+        If order Is Nothing Then Exit Sub
+
+        For idx = 1 To order.Count
+            sheetName = CStr(order(idx))
+            If allowed.Exists(sheetName) Then
+                historySpec = CStr(wsConfig.Cells(FindConfigRow(wsConfig, sheetName), 8).Value) ' Col H
+                If Len(Trim$(historySpec)) > 0 Then
+                    Set histOpt = ParseHistorySpec(historySpec)
+                    If IsHistoryOn(histOpt) Then
+                        AppendOneTargetToHistory sheetName, histOpt, runID
+                    End If
+                End If
+            End If
+        Next idx
+        Exit Sub
+    End If
+
+    ' Else: full pass over all config rows
+    lastRow = wsConfig.Cells(wsConfig.Rows.Count, 1).End(xlUp).Row
+    For i = 2 To lastRow
+        sheetName = CStr(wsConfig.Cells(i, 1).Value)
+        historySpec = CStr(wsConfig.Cells(i, 8).Value) ' Column H
+        If Len(Trim$(sheetName)) > 0 And Len(Trim$(historySpec)) > 0 Then
+            Set histOpt = ParseHistorySpec(historySpec)
+            If IsHistoryOn(histOpt) Then
+                AppendOneTargetToHistory sheetName, histOpt, runID
+            End If
+        End If
+    Next i
+End Sub
+
+
+' ========= APPEND ONE TARGET =========
+
+Private Sub AppendOneTargetToHistory(ByVal targetSheetName As String, _
+                                     ByVal histOpt As Object, _
+                                     ByVal runID As String)
+    Dim wsTarget As Worksheet, wsHist As Worksheet
+    Dim histSheetName As String
+    Dim tgtLastRow As Long, tgtLastCol As Long
+    Dim tgtHeaders As Variant, tgtBody As Range
+    Dim histHeaders As Variant
+    Dim businessCols As Collection
+    Dim warnMissing As Boolean
+
+    If Not SheetExists(targetSheetName) Then Exit Sub
+    Set wsTarget = ThisWorkbook.Sheets(targetSheetName)
+
+    tgtLastRow = GetLastUsedRow(wsTarget)
+    tgtLastCol = GetLastUsedCol(wsTarget)
+    If tgtLastRow < 2 Or tgtLastCol < 1 Then Exit Sub ' nothing to append
+
+    ' Read target headers
+    tgtHeaders = wsTarget.Range(wsTarget.Cells(1, 1), wsTarget.Cells(1, tgtLastCol)).Value
+    Set tgtBody = wsTarget.Range(wsTarget.Cells(2, 1), wsTarget.Cells(tgtLastRow, tgtLastCol))
+
+    histSheetName = GetDict(histOpt, "historysheet", "Historical")
+    warnMissing = CBool(GetDict(histOpt, "historywarnmissingcols", "False"))
+
+    ' Decide business columns to store
+    Set businessCols = ResolveBusinessColumns(histOpt, tgtHeaders, warnMissing)
+
+    ' Ensure/create Historical and schema
+    Set wsHist = EnsureHistoricalSchema(histSheetName, businessCols)
+
+    ' OPTIONAL: overwrite policy before append
+    ApplyOverwritePolicy wsHist, targetSheetName, histOpt, runID, wsTarget, businessCols
+
+    ' OPTIONAL: build dedup index from Historical (if keys provided)
+    Dim dedupKeys As Collection
+    Set dedupKeys = ResolveDedupKeys(histOpt)
+
+    Dim existingKeySet As Object
+    If Not dedupKeys Is Nothing Then
+        Set existingKeySet = BuildExistingKeySet(wsHist, dedupKeys)
+    End If
+
+    ' Build rows to append (with lineage)
+    Dim outArr As Variant
+    outArr = BuildAppendArray(wsTarget, wsHist, tgtHeaders, tgtBody, businessCols, _
+                              targetSheetName, histOpt, runID, existingKeySet, dedupKeys)
+
+    ' Append if any rows survived dedup
+    If Not IsEmpty(outArr) Then
+        AppendRows wsHist, outArr
+    End If
+End Sub
+
+
+' ========= PARSING & OPTION HELPERS =========
+
+Private Function ParseHistorySpec(ByVal spec As String) As Object
+    Dim d As Object: Set d = CreateObject("Scripting.Dictionary")
+    Dim parts() As String, i As Long, kv() As String, k As String, v As String
+    spec = Trim$(spec)
+    If Len(spec) = 0 Then Set ParseHistorySpec = d: Exit Function
+
+    parts = Split(spec, ";")
+    For i = LBound(parts) To UBound(parts)
+        If InStr(parts(i), "=") > 0 Then
+            kv = Split(parts(i), "=", 2)
+            k = LCase$(Trim$(kv(0)))
+            v = Trim$(kv(1))
+            If Len(k) > 0 Then d(k) = v
+        Else
+            If Len(Trim$(parts(i))) > 0 Then d(LCase$(Trim$(parts(i)))) = "True"
+        End If
+    Next i
+    Set ParseHistorySpec = d
+End Function
+
+Private Function IsHistoryOn(ByVal histOpt As Object) As Boolean
+    Dim flag As String
+    flag = GetDict(histOpt, "history", "")
+    IsHistoryOn = (LCase$(flag) = "on" Or LCase$(flag) = "true" Or LCase$(flag) = "yes")
+End Function
+
+Private Function GetDict(d As Object, key As String, Optional defaultVal As String = "") As String
+    If d.Exists(LCase$(key)) Then
+        GetDict = CStr(d(LCase$(key)))
+    Else
+        GetDict = defaultVal
+    End If
+End Function
+
+Private Function ResolveBusinessColumns(histOpt As Object, tgtHeaders As Variant, _
+                                        warnMissing As Boolean) As Collection
+    Dim colSpec As String
+    Dim c As Long, last As Long
+    Dim colName As String
+    Dim cols As New Collection
+    Dim wanted() As String, i As Long, found As Boolean
+
+    colSpec = GetDict(histOpt, "historycolumns", "__TARGET__")
+
+    If LCase$(colSpec) = "__target__" Then
+        ' mirror target headers (in order)
+        last = UBound(tgtHeaders, 2)
+        For c = 1 To last
+            colName = Trim$(CStr(tgtHeaders(1, c)))
+            If Len(colName) > 0 Then cols.Add colName
+        Next c
+        Set ResolveBusinessColumns = cols
+        Exit Function
+    End If
+
+    ' explicit list by |
+    wanted = Split(colSpec, "|")
+    last = UBound(tgtHeaders, 2)
+
+    For i = LBound(wanted) To UBound(wanted)
+        colName = Trim$(CStr(wanted(i)))
+        If Len(colName) = 0 Then GoTo NextWanted
+
+        ' check existence in target headers
+        found = False
+        For c = 1 To last
+            If StrComp(colName, Trim$(CStr(tgtHeaders(1, c))), vbTextCompare) = 0 Then
+                found = True: Exit For
+            End If
+        Next c
+
+        If found Then
+            cols.Add colName
+        ElseIf warnMissing Then
+            MsgBox "HistoryColumns: target header not found: " & colName, vbExclamation
+        End If
+NextWanted:
+    Next i
+
+    Set ResolveBusinessColumns = cols
+End Function
+
+Private Function ResolveDedupKeys(histOpt As Object) As Collection
+    Dim keySpec As String, parts() As String, i As Long
+    keySpec = GetDict(histOpt, "historydedupkeys", "")
+    If Len(Trim$(keySpec)) = 0 Then
+        Set ResolveDedupKeys = Nothing
+        Exit Function
+    End If
+    Dim keys As New Collection
+    parts = Split(keySpec, "|")
+    For i = LBound(parts) To UBound(parts)
+        If Len(Trim$(parts(i))) > 0 Then keys.Add Trim$(parts(i))
+    Next i
+    Set ResolveDedupKeys = keys
+End Function
+
+
+' ========= SCHEMA & APPENDERS =========
+
+Private Function EnsureHistoricalSchema(histSheetName As String, _
+                                        businessCols As Collection) As Worksheet
+    Dim ws As Worksheet
+    Dim needHeaders As Boolean
+    Dim histLastCol As Long, hMap As Object
+    Dim i As Long, name As String
+
+    If SheetExists(histSheetName) Then
+        Set ws = ThisWorkbook.Sheets(histSheetName)
+        If GetLastUsedRow(ws) < 1 Then needHeaders = True
+    Else
+        Set ws = GetOrCreateSheet(histSheetName)
+        needHeaders = True
+    End If
+
+    If needHeaders Then
+        ' create initial header row: lineage + business
+        Dim hdrs() As Variant
+        ReDim hdrs(1 To 1, 1 To (4 + businessCols.Count))
+        hdrs(1, 1) = "SheetName"
+        hdrs(1, 2) = "RecordDate"
+        hdrs(1, 3) = "RunID"
+        hdrs(1, 4) = "LoadTS"
+        For i = 1 To businessCols.Count
+            hdrs(1, 4 + i) = businessCols(i)
+        Next i
+        ws.Range(ws.Cells(1, 1), ws.Cells(1, 4 + businessCols.Count)).Value = hdrs
+        ws.Rows(1).Font.Bold = True
+    Else
+        ' ensure all business columns exist; add missing to the right
+        Set hMap = HeaderMap(ws)
+        For i = 1 To businessCols.Count
+            name = businessCols(i)
+            If Not hMap.Exists(LCase$(name)) Then
+                histLastCol = GetLastUsedCol(ws) + 1
+                ws.Cells(1, histLastCol).Value = name
+            End If
+        Next i
+    End If
+
+    Set EnsureHistoricalSchema = ws
+End Function
+
+Private Function HeaderMap(ws As Worksheet) As Object
+    Dim d As Object: Set d = CreateObject("Scripting.Dictionary")
+    Dim lastCol As Long, c As Long, name As String
+    lastCol = GetLastUsedCol(ws)
+    For c = 1 To lastCol
+        name = Trim$(CStr(ws.Cells(1, c).Value))
+        If Len(name) > 0 Then d(LCase$(name)) = c
+    Next c
+    Set HeaderMap = d
+End Function
+
+Private Function BuildAppendArray(wsTarget As Worksheet, wsHist As Worksheet, _
+                                  tgtHeaders As Variant, tgtBody As Range, _
+                                  businessCols As Collection, _
+                                  ByVal sheetName As String, _
+                                  histOpt As Object, _
+                                  ByVal runID As String, _
+                                  existingKeySet As Object, _
+                                  dedupKeys As Collection) As Variant
+    Dim histMap As Object: Set histMap = HeaderMap(wsHist)
+    Dim tgtMap As Object: Set tgtMap = CreateObject("Scripting.Dictionary")
+
+    ' map target headers
+    Dim c As Long, lastT As Long
+    lastT = UBound(tgtHeaders, 2)
+    For c = 1 To lastT
+        tgtMap(LCase$(Trim$(CStr(tgtHeaders(1, c))))) = c
+    Next c
+
+    ' column indexes in Historical for lineage + business
+    Dim colSheetName As Long, colRecordDate As Long, colRunID As Long, colLoadTS As Long
+    colSheetName = histMap("sheetname")
+    colRecordDate = histMap("recorddate")
+    colRunID = histMap("runid")
+    colLoadTS = histMap("loadts")
+
+    ' per-row RecordDate resolution
+    Dim dateColName As String, dateConst As String, dateColIdxTgt As Long
+    dateColName = GetDict(histOpt, "historydatecol", "")
+    dateConst = GetDict(histOpt, "historydate", "")
+
+    If Len(Trim$(dateColName)) > 0 And tgtMap.Exists(LCase$(dateColName)) Then
+        dateColIdxTgt = CLng(tgtMap(LCase$(dateColName)))
+    Else
+        dateColIdxTgt = 0
+    End If
+
+    ' Build output array
+    Dim r As Long, R As Long, outRows As Long, outCols As Long
+    Dim arrT As Variant: arrT = tgtBody.Value
+    Dim maxRows As Long: maxRows = UBound(arrT, 1)
+
+    ' We'll allocate a dynamic array and fill; count survivors (dedup).
+    outCols = GetLastUsedCol(wsHist)
+    Dim temp() As Variant
+    ReDim temp(1 To maxRows, 1 To outCols)
+
+    Dim k As Long, b As Long, tgtIdx As Long, histIdx As Long
+    Dim recDateVal As Variant, keyStr As String
+    Dim skipRow As Boolean
+
+    R = 0
+    For r = 1 To maxRows
+        ' Dedup key build (if requested)
+        skipRow = False
+        If Not dedupKeys Is Nothing Then
+            keyStr = BuildKeyString(wsHist, arrT, r, dateColIdxTgt, dateConst, sheetName, runID, businessCols, dedupKeys, tgtMap, histMap)
+            If existingKeySet.Exists(keyStr) Then
+                skipRow = True
+            End If
+        End If
+        If skipRow Then GoTo NextR
+
+        ' Lineage
+        R = R + 1
+        temp(R, colSheetName) = sheetName
+        temp(R, colRunID) = runID
+        temp(R, colLoadTS) = Now
+
+        ' RecordDate (priority: per-row date col -> constant -> Date())
+        If dateColIdxTgt > 0 Then
+            recDateVal = arrT(r, dateColIdxTgt)
+            If IsDate(recDateVal) Then
+                temp(R, colRecordDate) = CDate(recDateVal)
+            ElseIf Len(Trim$(CStr(recDateVal))) > 0 Then
+                On Error Resume Next
+                temp(R, colRecordDate) = CDate(recDateVal)
+                If Err.Number <> 0 Then temp(R, colRecordDate) = Date
+                On Error GoTo 0
+            Else
+                temp(R, colRecordDate) = IIf(Len(dateConst) > 0, CDate(dateConst), Date)
+            End If
+        ElseIf Len(dateConst) > 0 Then
+            temp(R, colRecordDate) = CDate(dateConst)
+        Else
+            temp(R, colRecordDate) = Date
+        End If
+
+        ' Business columns by name
+        For b = 1 To businessCols.Count
+            histIdx = CLng(histMap(LCase$(businessCols(b))))
+            If tgtMap.Exists(LCase$(businessCols(b))) Then
+                tgtIdx = CLng(tgtMap(LCase$(businessCols(b))))
+                temp(R, histIdx) = arrT(r, tgtIdx)
+            Else
+                temp(R, histIdx) = Empty ' target didn't have this col (already warned if enabled)
+            End If
+        Next b
+
+NextR:
+    Next r
+
+    If R = 0 Then
+        BuildAppendArray = Empty
+    Else
+        Dim outArr() As Variant
+        ReDim outArr(1 To R, 1 To outCols)
+        For r = 1 To R
+            For c = 1 To outCols
+                outArr(r, c) = temp(r, c)
+            Next c
+        Next r
+        BuildAppendArray = outArr
+    End If
+End Function
+
+Private Sub AppendRows(wsHist As Worksheet, outArr As Variant)
+    Dim startRow As Long, rowsToWrite As Long, colsToWrite As Long
+    startRow = GetLastUsedRow(wsHist) + 1
+    rowsToWrite = UBound(outArr, 1)
+    colsToWrite = UBound(outArr, 2)
+
+    wsHist.Range(wsHist.Cells(startRow, 1), _
+                 wsHist.Cells(startRow + rowsToWrite - 1, colsToWrite)).Value = outArr
+End Sub
+
+
+' ========= DEDUP / OVERWRITE =========
+
+Private Function BuildExistingKeySet(wsHist As Worksheet, dedupKeys As Collection) As Object
+    Dim d As Object: Set d = CreateObject("Scripting.Dictionary")
+    Dim hMap As Object: Set hMap = HeaderMap(wsHist)
+    Dim lastRow As Long, r As Long
+    Dim keyStr As String
+
+    lastRow = GetLastUsedRow(wsHist)
+    If lastRow < 2 Then
+        Set BuildExistingKeySet = d
+        Exit Function
+    End If
+
+    For r = 2 To lastRow
+        keyStr = RowKeyString(wsHist, r, hMap, dedupKeys)
+        If Len(keyStr) > 0 Then d(keyStr) = True
+    Next r
+
+    Set BuildExistingKeySet = d
+End Function
+
+Private Function RowKeyString(ws As Worksheet, r As Long, hMap As Object, dedupKeys As Collection) As String
+    Dim i As Long, colName As String, cIdx As Long
+    Dim parts As String
+    parts = ""
+    For i = 1 To dedupKeys.Count
+        colName = LCase$(dedupKeys(i))
+        If hMap.Exists(colName) Then
+            cIdx = hMap(colName)
+            parts = parts & "|" & NormalizeForKey(ws.Cells(r, cIdx).Value)
+        Else
+            parts = parts & "|" ' missing key column -> still keep placeholder
+        End If
+    Next i
+    If Len(parts) > 0 Then parts = Mid$(parts, 2)
+    RowKeyString = parts
+End Function
+
+Private Function BuildKeyString(wsHist As Worksheet, arrT As Variant, rT As Long, _
+                                dateColIdxTgt As Long, dateConst As String, _
+                                sheetName As String, runID As String, _
+                                businessCols As Collection, dedupKeys As Collection, _
+                                tgtMap As Object, histMap As Object) As String
+    Dim i As Long, name As String, piece As String, cIdxT As Long, val As Variant
+    Dim buf As String
+
+    buf = ""
+    For i = 1 To dedupKeys.Count
+        name = dedupKeys(i)
+
+        Select Case LCase$(name)
+            Case "sheetname":            piece = NormalizeForKey(sheetName)
+            Case "runid":                piece = NormalizeForKey(runID)
+            Case "recorddate"
+                If dateColIdxTgt > 0 Then
+                    val = arrT(rT, dateColIdxTgt)
+                    If IsDate(val) Then piece = Format$(CDate(val), "yyyy-mm-dd") Else piece = NormalizeForKey(val)
+                ElseIf Len(dateConst) > 0 Then
+                    piece = Format$(CDate(dateConst), "yyyy-mm-dd")
+                Else
+                    piece = Format$(Date, "yyyy-mm-dd")
+                End If
+            Case Else
+                ' treat as business/target column name
+                If tgtMap.Exists(LCase$(name)) Then
+                    cIdxT = CLng(tgtMap(LCase$(name)))
+                    val = arrT(rT, cIdxT)
+                    piece = NormalizeForKey(val)
+                Else
+                    piece = "" ' missing in target
+                End If
+        End Select
+
+        buf = buf & "|" & piece
+    Next i
+
+    If Len(buf) > 0 Then buf = Mid$(buf, 2)
+    BuildKeyString = buf
+End Function
+
+Private Function NormalizeForKey(v As Variant) As String
+    If IsDate(v) Then
+        NormalizeForKey = Format$(CDate(v), "yyyy-mm-dd")
+    ElseIf IsError(v) Or IsNull(v) Then
+        NormalizeForKey = ""
+    Else
+        NormalizeForKey = Trim$(CStr(v))
+    End If
+End Function
+
+Private Sub ApplyOverwritePolicy(wsHist As Worksheet, targetSheetName As String, _
+                                 histOpt As Object, runID As String, _
+                                 wsTarget As Worksheet, businessCols As Collection)
+    Dim policy As String
+    policy = LCase$(GetDict(histOpt, "historyoverwrite", ""))
+
+    If policy = "" Then Exit Sub
+
+    Dim hMap As Object: Set hMap = HeaderMap(wsHist)
+    Dim lastRow As Long, r As Long
+    Dim killRow As Boolean
+    Dim dateColName As String, dateConst As String, dateColIdxTgt As Long
+    Dim tgtMap As Object: Set tgtMap = CreateObject("Scripting.Dictionary")
+    Dim tgtHeaders As Variant
+    Dim c As Long, lastT As Long
+    Dim asOfStr As String
+
+    ' prepare target header map (for per-row RecordDate fallback)
+    lastT = GetLastUsedCol(wsTarget)
+    If lastT > 0 Then
+        tgtHeaders = wsTarget.Range(wsTarget.Cells(1, 1), wsTarget.Cells(1, lastT)).Value
+        For c = 1 To lastT
+            tgtMap(LCase$(Trim$(CStr(tgtHeaders(1, c))))) = c
+        Next c
+    End If
+
+    dateColName = GetDict(histOpt, "historydatecol", "")
+    dateConst = GetDict(histOpt, "historydate", "")
+    If Len(Trim$(dateConst)) > 0 Then
+        asOfStr = Format$(CDate(dateConst), "yyyy-mm-dd")
+    Else
+        asOfStr = Format$(Date, "yyyy-mm-dd") ' fallback
+    End If
+
+    lastRow = GetLastUsedRow(wsHist)
+    If lastRow < 2 Then Exit Sub
+
+    ' delete bottom-up as criteria match
+    For r = lastRow To 2 Step -1
+        killRow = False
+        Select Case policy
+            Case "runid"
+                If hMap.Exists("runid") Then
+                    killRow = (Trim$(CStr(wsHist.Cells(r, hMap("runid")).Value)) = runID)
+                End If
+
+            Case "recorddate"
+                ' delete prior rows for this SheetName + RecordDate
+                If hMap.Exists("sheetname") And hMap.Exists("recorddate") Then
+                    Dim sName As String, dVal As Variant, dStr As String
+                    sName = Trim$(CStr(wsHist.Cells(r, hMap("sheetname")).Value))
+                    dVal = wsHist.Cells(r, hMap("recorddate")).Value
+                    If IsDate(dVal) Then dStr = Format$(CDate(dVal), "yyyy-mm-dd") Else dStr = ""
+                    killRow = (StrComp(sName, targetSheetName, vbTextCompare) = 0 And dStr = asOfStr)
+                End If
+        End Select
+
+        If killRow Then wsHist.Rows(r).Delete
+    Next r
+End Sub
+
+
+' ========= UTILITIES =========
+
+Private Function GenerateRunID() As String
+    GenerateRunID = "RUN-" & Format$(Now, "yyyymmdd-hhnnss") & "-" & Right$(CStr(Timer * 1000), 3)
+End Function
